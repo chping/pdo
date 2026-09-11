@@ -19,8 +19,8 @@ const (
 	supportedSchemaVersion = 1
 	maxAPIResponse         = 4 << 20
 	usage                  = `Usage:
-  pdo download ssh-config
-  pdo upload ssh-config`
+  cpdo download ssh-config
+  cpdo upload ssh-config`
 )
 
 var githubAPIBase = "https://api.github.com"
@@ -72,21 +72,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	home, err := os.UserHomeDir()
 	if err != nil {
-		fmt.Fprintf(stderr, "pdo: find home directory: %v\n", err)
+		fmt.Fprintf(stderr, "cpdo: find home directory: %v\n", err)
 		return 1
 	}
-	cfg, err := loadConfig(filepath.Join(home, ".config", "pdo", "config.json"))
+	cfg, err := loadConfig(filepath.Join(home, ".config", "cpdo", "config.json"))
 	if err != nil {
-		fmt.Fprintf(stderr, "pdo: %v\n", err)
+		fmt.Fprintf(stderr, "cpdo: %v\n", err)
 		return 1
 	}
 	if err := cfg.validateSSHConfig(); err != nil {
-		fmt.Fprintf(stderr, "pdo: %v\n", err)
+		fmt.Fprintf(stderr, "cpdo: %v\n", err)
 		return 1
 	}
 	token := os.Getenv(cfg.GitHub.PATEnv)
 	if token == "" {
-		fmt.Fprintf(stderr, "pdo: environment variable %s is empty\n", cfg.GitHub.PATEnv)
+		fmt.Fprintf(stderr, "cpdo: environment variable %s is empty\n", cfg.GitHub.PATEnv)
 		return 1
 	}
 
@@ -105,7 +105,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		message, err = uploadSSHConfig(home, &client)
 	}
 	if err != nil {
-		fmt.Fprintf(stderr, "pdo: %v\n", err)
+		fmt.Fprintf(stderr, "cpdo: %v\n", err)
 		return 1
 	}
 	fmt.Fprintln(stdout, message)
@@ -243,13 +243,13 @@ func inspectLocalFile(path string) (string, bool, error) {
 func replaceLocalFile(path string, oldData, newData []byte, existed bool) (string, error) {
 	backup := ""
 	if existed {
-		backup = path + ".pdo-backup-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+		backup = path + ".cpdo-backup-" + time.Now().UTC().Format("20060102T150405.000000000Z")
 		if err := writeExclusive(backup, oldData); err != nil {
 			return "", fmt.Errorf("create backup: %w", err)
 		}
 	}
 
-	temp, err := os.CreateTemp(filepath.Dir(path), ".pdo-config-*")
+	temp, err := os.CreateTemp(filepath.Dir(path), ".cpdo-config-*")
 	if err != nil {
 		return backup, fmt.Errorf("create temporary ssh config: %w", err)
 	}
@@ -357,7 +357,7 @@ func (client *githubClient) put(content []byte, sha string) error {
 		SHA     string `json:"sha,omitempty"`
 		Branch  string `json:"branch"`
 	}{
-		Message: "pdo: upload ssh_config",
+		Message: "cpdo: upload ssh_config",
 		Content: base64.StdEncoding.EncodeToString(content),
 		SHA:     sha,
 		Branch:  client.branch,
@@ -407,7 +407,7 @@ func (client *githubClient) request(method string, body []byte, includeRef bool)
 	request.Header.Set("Accept", "application/vnd.github+json")
 	request.Header.Set("Authorization", "Bearer "+client.token)
 	request.Header.Set("X-GitHub-Api-Version", "2026-03-10")
-	request.Header.Set("User-Agent", "pdo")
+	request.Header.Set("User-Agent", "cpdo")
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}

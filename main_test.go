@@ -17,7 +17,7 @@ import (
 func TestLoadConfig(t *testing.T) {
 	valid := `{
   "schema_version": 1,
-  "github": {"pat_env": "PDO_GITHUB_PAT"},
+  "github": {"pat_env": "CPDO_GITHUB_PAT"},
   "ssh_config": {"repository": "owner/repo", "branch": "main", "path": "ssh/config"},
   "future_command": {"enabled": true}
 }`
@@ -30,7 +30,7 @@ func TestLoadConfig(t *testing.T) {
 		{name: "valid with unknown feature", content: valid, validateSSH: true},
 		{name: "unrelated feature does not need ssh config", content: `{"schema_version":1,"future_command":{"enabled":true}}`},
 		{name: "newer schema", content: strings.Replace(valid, `"schema_version": 1`, `"schema_version": 2`, 1), wantErr: "unsupported schema_version"},
-		{name: "missing PAT env", content: strings.Replace(valid, `"PDO_GITHUB_PAT"`, `""`, 1), validateSSH: true, wantErr: "github.pat_env is required"},
+		{name: "missing PAT env", content: strings.Replace(valid, `"CPDO_GITHUB_PAT"`, `""`, 1), validateSSH: true, wantErr: "github.pat_env is required"},
 		{name: "invalid repository", content: strings.Replace(valid, `"owner/repo"`, `"owner/repo/extra"`, 1), validateSSH: true, wantErr: "OWNER/REPOSITORY"},
 		{name: "missing branch", content: strings.Replace(valid, `"main"`, `""`, 1), validateSSH: true, wantErr: "ssh_config.branch is required"},
 		{name: "absolute path", content: strings.Replace(valid, `"ssh/config"`, `"/ssh/config"`, 1), validateSSH: true, wantErr: "relative repository path"},
@@ -65,7 +65,7 @@ func TestLoadConfig(t *testing.T) {
 
 func TestRunUsageExitCodes(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"--help"}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "pdo download") {
+	if code := run([]string{"--help"}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "cpdo download") {
 		t.Fatalf("help: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 	stdout.Reset()
@@ -98,14 +98,14 @@ func TestRunDownload(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
-	t.Setenv("PDO_GITHUB_PAT", "integration-token")
-	configDir := filepath.Join(home, ".config", "pdo")
+	t.Setenv("CPDO_GITHUB_PAT", "integration-token")
+	configDir := filepath.Join(home, ".config", "cpdo")
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	configJSON := `{
   "schema_version": 1,
-  "github": {"pat_env": "PDO_GITHUB_PAT"},
+  "github": {"pat_env": "CPDO_GITHUB_PAT"},
   "ssh_config": {"repository": "owner/repo", "branch": "main", "path": "ssh/config"}
 }`
 	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(configJSON), 0o600); err != nil {
@@ -154,7 +154,7 @@ func TestDownloadCreatesAndNoOps(t *testing.T) {
 	if message != "ssh_config is already up to date" {
 		t.Fatalf("message = %q", message)
 	}
-	backups, err := filepath.Glob(path + ".pdo-backup-*")
+	backups, err := filepath.Glob(path + ".cpdo-backup-*")
 	if err != nil || len(backups) != 0 {
 		t.Fatalf("backups = %v, error = %v", backups, err)
 	}
@@ -179,7 +179,7 @@ func TestDownloadBacksUpAndReplaces(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertFileContent(t, path, []byte("new\n"))
-	backups, err := filepath.Glob(path + ".pdo-backup-*")
+	backups, err := filepath.Glob(path + ".cpdo-backup-*")
 	if err != nil || len(backups) != 1 {
 		t.Fatalf("backups = %v, error = %v", backups, err)
 	}
@@ -223,7 +223,7 @@ func TestDownloadFollowsSymlink(t *testing.T) {
 	if info, err := os.Lstat(configLink); err != nil || info.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("config symlink was replaced: info=%v error=%v", info, err)
 	}
-	backups, err := filepath.Glob(target + ".pdo-backup-*")
+	backups, err := filepath.Glob(target + ".cpdo-backup-*")
 	if err != nil || len(backups) != 1 {
 		t.Fatalf("target backups = %v, error = %v", backups, err)
 	}
@@ -284,7 +284,7 @@ func TestDownloadAPIFailureLeavesLocalUntouched(t *testing.T) {
 		t.Fatal("expected download error")
 	}
 	assertFileContent(t, path, []byte("local\n"))
-	backups, _ := filepath.Glob(path + ".pdo-backup-*")
+	backups, _ := filepath.Glob(path + ".cpdo-backup-*")
 	if len(backups) != 0 {
 		t.Fatalf("unexpected backups: %v", backups)
 	}
@@ -323,7 +323,7 @@ func TestUploadCreatesAndUpdates(t *testing.T) {
 					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 						t.Fatal(err)
 					}
-					if payload.Message != "pdo: upload ssh_config" || payload.SHA != test.wantPutSHA || payload.Branch != "main" {
+					if payload.Message != "cpdo: upload ssh_config" || payload.SHA != test.wantPutSHA || payload.Branch != "main" {
 						t.Fatalf("payload = %+v", payload)
 					}
 					decoded, err := base64.StdEncoding.DecodeString(payload.Content)
