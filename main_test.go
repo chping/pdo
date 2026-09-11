@@ -17,7 +17,7 @@ import (
 func TestLoadConfig(t *testing.T) {
 	valid := `{
   "schema_version": 1,
-  "github": {"token_env": "PDO_TOKEN"},
+  "github": {"pat_env": "PDO_GITHUB_PAT"},
   "ssh_config": {"repository": "owner/repo", "branch": "main", "path": "ssh/config"},
   "future_command": {"enabled": true}
 }`
@@ -30,7 +30,7 @@ func TestLoadConfig(t *testing.T) {
 		{name: "valid with unknown feature", content: valid, validateSSH: true},
 		{name: "unrelated feature does not need ssh config", content: `{"schema_version":1,"future_command":{"enabled":true}}`},
 		{name: "newer schema", content: strings.Replace(valid, `"schema_version": 1`, `"schema_version": 2`, 1), wantErr: "unsupported schema_version"},
-		{name: "missing token env", content: strings.Replace(valid, `"PDO_TOKEN"`, `""`, 1), validateSSH: true, wantErr: "github.token_env is required"},
+		{name: "missing PAT env", content: strings.Replace(valid, `"PDO_GITHUB_PAT"`, `""`, 1), validateSSH: true, wantErr: "github.pat_env is required"},
 		{name: "invalid repository", content: strings.Replace(valid, `"owner/repo"`, `"owner/repo/extra"`, 1), validateSSH: true, wantErr: "OWNER/REPOSITORY"},
 		{name: "missing branch", content: strings.Replace(valid, `"main"`, `""`, 1), validateSSH: true, wantErr: "ssh_config.branch is required"},
 		{name: "absolute path", content: strings.Replace(valid, `"ssh/config"`, `"/ssh/config"`, 1), validateSSH: true, wantErr: "relative repository path"},
@@ -98,14 +98,14 @@ func TestRunDownload(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
-	t.Setenv("PDO_TOKEN", "integration-token")
+	t.Setenv("PDO_GITHUB_PAT", "integration-token")
 	configDir := filepath.Join(home, ".config", "pdo")
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	configJSON := `{
   "schema_version": 1,
-  "github": {"token_env": "PDO_TOKEN"},
+  "github": {"pat_env": "PDO_GITHUB_PAT"},
   "ssh_config": {"repository": "owner/repo", "branch": "main", "path": "ssh/config"}
 }`
 	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(configJSON), 0o600); err != nil {

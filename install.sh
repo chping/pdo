@@ -64,7 +64,7 @@ if [ ! -e "$pdo_config" ] && [ ! -L "$pdo_config" ]; then
 {
   "schema_version": 1,
   "github": {
-    "token_env": "PDO_TOKEN"
+    "pat_env": "PDO_GITHUB_PAT"
   },
   "ssh_config": {
     "repository": "OWNER/REPOSITORY",
@@ -81,4 +81,4 @@ case ":$PATH:" in
   *":$pdo_install_dir:"*) ;;
   *) echo "Add $pdo_install_dir to PATH before running pdo." ;;
 esac
-echo "Edit $pdo_config and set PDO_TOKEN in your environment."
+echo "Edit $pdo_config and set PDO_GITHUB_PAT in your environment."

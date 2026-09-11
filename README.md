@@ -28,7 +28,7 @@ irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
 {
   "schema_version": 1,
   "github": {
-    "token_env": "PDO_TOKEN"
+    "pat_env": "PDO_GITHUB_PAT"
   },
   "ssh_config": {
     "repository": "OWNER/REPOSITORY",
@@ -41,11 +41,11 @@ irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
 创建一个仅能访问目标私有仓库的 GitHub fine-grained personal access token，并赋予 Contents 读写权限。token 只从配置指定的环境变量读取，不写入配置文件：
 
 ```sh
-export PDO_TOKEN="your-token"
+export PDO_GITHUB_PAT="your-token"
 ```
 
 ```powershell
-$env:PDO_TOKEN = "your-token"
+$env:PDO_GITHUB_PAT = "your-token"
 ```
 
 配置按功能分区。未来新增功能时添加新的顶层区块；未识别区块会被旧版本忽略。只有破坏性配置变更才增加 `schema_version`。

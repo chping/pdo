@@ -53,7 +53,7 @@ try {
 {
   "schema_version": 1,
   "github": {
-    "token_env": "PDO_TOKEN"
+    "pat_env": "PDO_GITHUB_PAT"
   },
   "ssh_config": {
     "repository": "OWNER/REPOSITORY",
@@ -73,7 +73,7 @@ try {
         Write-Warning "$pdoInstallDir is not in PATH. Add it with:"
         Write-Host "[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';$pdoInstallDir', 'User')"
     }
-    Write-Host "Edit $pdoConfig and set `$env:PDO_TOKEN in your environment."
+    Write-Host "Edit $pdoConfig and set `$env:PDO_GITHUB_PAT in your environment."
 }
 finally {
     Remove-Item -LiteralPath $pdoTempDir -Recurse -Force -ErrorAction SilentlyContinue

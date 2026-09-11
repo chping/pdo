@@ -32,7 +32,7 @@ type config struct {
 }
 
 type githubConfig struct {
-	TokenEnv string `json:"token_env"`
+	PATEnv string `json:"pat_env"`
 }
 
 type sshConfigConfig struct {
@@ -84,9 +84,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "pdo: %v\n", err)
 		return 1
 	}
-	token := os.Getenv(cfg.GitHub.TokenEnv)
+	token := os.Getenv(cfg.GitHub.PATEnv)
 	if token == "" {
-		fmt.Fprintf(stderr, "pdo: environment variable %s is empty\n", cfg.GitHub.TokenEnv)
+		fmt.Fprintf(stderr, "pdo: environment variable %s is empty\n", cfg.GitHub.PATEnv)
 		return 1
 	}
 
@@ -128,8 +128,8 @@ func loadConfig(path string) (config, error) {
 }
 
 func (cfg config) validateSSHConfig() error {
-	if cfg.GitHub.TokenEnv == "" {
-		return fmt.Errorf("github.token_env is required")
+	if cfg.GitHub.PATEnv == "" {
+		return fmt.Errorf("github.pat_env is required")
 	}
 	if cfg.SSHConfig.Repository == "" {
 		return fmt.Errorf("ssh_config.repository is required")
