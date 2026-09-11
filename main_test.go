@@ -78,7 +78,7 @@ func TestRunUsageExitCodes(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
-	if code := run([]string{"download", "ssh_config"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "read config") {
+	if code := run([]string{"download", "ssh-config"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "read config") {
 		t.Fatalf("runtime error: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 }
@@ -113,7 +113,7 @@ func TestRunDownload(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"download", "ssh_config"}, &stdout, &stderr); code != 0 {
+	if code := run([]string{"download", "ssh-config"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 	assertFileContent(t, filepath.Join(home, ".ssh", "config"), remote)

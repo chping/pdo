@@ -53,8 +53,8 @@ $env:PDO_GITHUB_PAT = "your-token"
 ## 使用
 
 ```sh
-pdo download ssh_config
-pdo upload ssh_config
+pdo download ssh-config
+pdo upload ssh-config
 pdo --help
 ```
 

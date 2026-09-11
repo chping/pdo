@@ -19,8 +19,8 @@ const (
 	supportedSchemaVersion = 1
 	maxAPIResponse         = 4 << 20
 	usage                  = `Usage:
-  pdo download ssh_config
-  pdo upload ssh_config`
+  pdo download ssh-config
+  pdo upload ssh-config`
 )
 
 var githubAPIBase = "https://api.github.com"
@@ -65,7 +65,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, usage)
 		return 0
 	}
-	if len(args) != 2 || (args[0] != "download" && args[0] != "upload") || args[1] != "ssh_config" {
+	if len(args) != 2 || (args[0] != "download" && args[0] != "upload") || args[1] != "ssh-config" {
 		fmt.Fprintln(stderr, usage)
 		return 2
 	}
