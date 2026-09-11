@@ -184,7 +184,7 @@ func TestDownloadBacksUpAndReplaces(t *testing.T) {
 		t.Fatalf("backups = %v, error = %v", backups, err)
 	}
 	assertFileContent(t, backups[0], []byte("old\n"))
-	if !strings.Contains(message, backups[0]) {
+	if !strings.Contains(message, filepath.Base(backups[0])) {
 		t.Fatalf("message = %q", message)
 	}
 }
