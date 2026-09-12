@@ -2,79 +2,80 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 if ($env:OS -ne "Windows_NT") {
-    throw "cpdo: install.ps1 only supports Windows"
+    throw "pdo: install.ps1 only supports Windows"
 }
 
-$cpdoProcessor = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
-$cpdoArch = switch ($cpdoProcessor.ToUpperInvariant()) {
+$pdoProcessor = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+$pdoArch = switch ($pdoProcessor.ToUpperInvariant()) {
     "AMD64" { "amd64" }
     "ARM64" { "arm64" }
-    default { throw "cpdo: unsupported architecture: $cpdoProcessor" }
+    default { throw "pdo: unsupported architecture: $pdoProcessor" }
 }
 
-$cpdoAsset = "cpdo_windows_$cpdoArch.exe"
-$cpdoBaseUrl = "https://github.com/chping/cpdo/releases/latest/download"
-$cpdoTempDir = Join-Path ([IO.Path]::GetTempPath()) ("cpdo-" + [Guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $cpdoTempDir | Out-Null
+$pdoAsset = "pdo_windows_$pdoArch.exe"
+$pdoBaseUrl = "https://github.com/chping/pdo/releases/latest/download"
+$pdoTempDir = Join-Path ([IO.Path]::GetTempPath()) ("pdo-" + [Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $pdoTempDir | Out-Null
 
 try {
-    $cpdoDownload = Join-Path $cpdoTempDir $cpdoAsset
-    $cpdoChecksums = Join-Path $cpdoTempDir "SHA256SUMS"
-    Invoke-WebRequest -UseBasicParsing -Uri "$cpdoBaseUrl/$cpdoAsset" -OutFile $cpdoDownload
-    Invoke-WebRequest -UseBasicParsing -Uri "$cpdoBaseUrl/SHA256SUMS" -OutFile $cpdoChecksums
+    $pdoDownload = Join-Path $pdoTempDir $pdoAsset
+    $pdoChecksums = Join-Path $pdoTempDir "SHA256SUMS"
+    Invoke-WebRequest -UseBasicParsing -Uri "$pdoBaseUrl/$pdoAsset" -OutFile $pdoDownload
+    Invoke-WebRequest -UseBasicParsing -Uri "$pdoBaseUrl/SHA256SUMS" -OutFile $pdoChecksums
 
-    $cpdoExpected = $null
-    foreach ($cpdoLine in Get-Content -LiteralPath $cpdoChecksums) {
-        $cpdoParts = $cpdoLine.Trim() -split '\s+', 2
-        if ($cpdoParts.Count -eq 2 -and $cpdoParts[1].TrimStart("*") -eq $cpdoAsset) {
-            $cpdoExpected = $cpdoParts[0].ToLowerInvariant()
+    $pdoExpected = $null
+    foreach ($pdoLine in Get-Content -LiteralPath $pdoChecksums) {
+        $pdoParts = $pdoLine.Trim() -split '\s+', 2
+        if ($pdoParts.Count -eq 2 -and $pdoParts[1].TrimStart("*") -eq $pdoAsset) {
+            $pdoExpected = $pdoParts[0].ToLowerInvariant()
             break
         }
     }
-    if (-not $cpdoExpected) {
-        throw "cpdo: checksum not found for $cpdoAsset"
+    if (-not $pdoExpected) {
+        throw "pdo: checksum not found for $pdoAsset"
     }
-    $cpdoActual = (Get-FileHash -Algorithm SHA256 -LiteralPath $cpdoDownload).Hash.ToLowerInvariant()
-    if ($cpdoExpected -ne $cpdoActual) {
-        throw "cpdo: checksum verification failed"
+    $pdoActual = (Get-FileHash -Algorithm SHA256 -LiteralPath $pdoDownload).Hash.ToLowerInvariant()
+    if ($pdoExpected -ne $pdoActual) {
+        throw "pdo: checksum verification failed"
     }
 
-    $cpdoInstallDir = Join-Path ([Environment]::GetFolderPath("LocalApplicationData")) "Programs\cpdo"
-    New-Item -ItemType Directory -Force -Path $cpdoInstallDir | Out-Null
-    $cpdoStaged = Join-Path $cpdoInstallDir (".cpdo-" + $PID + ".tmp")
-    Copy-Item -LiteralPath $cpdoDownload -Destination $cpdoStaged -Force
-    Move-Item -LiteralPath $cpdoStaged -Destination (Join-Path $cpdoInstallDir "cpdo.exe") -Force
+    $pdoInstallDir = Join-Path ([Environment]::GetFolderPath("LocalApplicationData")) "Programs\pdo"
+    New-Item -ItemType Directory -Force -Path $pdoInstallDir | Out-Null
+    $pdoStaged = Join-Path $pdoInstallDir (".pdo-" + $PID + ".tmp")
+    Copy-Item -LiteralPath $pdoDownload -Destination $pdoStaged -Force
+    Move-Item -LiteralPath $pdoStaged -Destination (Join-Path $pdoInstallDir "pdo.exe") -Force
 
-    $cpdoConfigDir = Join-Path ([Environment]::GetFolderPath("UserProfile")) ".config\cpdo"
-    $cpdoConfig = Join-Path $cpdoConfigDir "config.json"
-    if (-not (Test-Path -LiteralPath $cpdoConfig)) {
-        New-Item -ItemType Directory -Force -Path $cpdoConfigDir | Out-Null
-        $cpdoTemplate = @'
+    $pdoConfigDir = Join-Path ([Environment]::GetFolderPath("UserProfile")) ".config\pdo"
+    $pdoConfig = Join-Path $pdoConfigDir "config.json"
+    if (-not (Test-Path -LiteralPath $pdoConfig)) {
+        New-Item -ItemType Directory -Force -Path $pdoConfigDir | Out-Null
+        $pdoTemplate = @'
 {
   "schema_version": 1,
   "github": {
-    "pat_env": "CPDO_GITHUB_PAT"
+    "pat_env": "PDO_GITHUB_PAT"
   },
-  "ssh_config": {
-    "repository": "OWNER/REPOSITORY",
-    "branch": "main",
-    "path": "ssh_config"
+  "dotfiles": {
+    "ssh-config": {
+      "remote": "https://api.github.com/repos/OWNER/REPOSITORY/contents/ssh_config?ref=main",
+      "local": "~/.ssh/config"
+    }
   }
 }
 '@
-        $cpdoUtf8 = New-Object System.Text.UTF8Encoding($false)
-        [IO.File]::WriteAllText($cpdoConfig, $cpdoTemplate + [Environment]::NewLine, $cpdoUtf8)
-        Write-Host "Created $cpdoConfig"
+        $pdoUtf8 = New-Object System.Text.UTF8Encoding($false)
+        [IO.File]::WriteAllText($pdoConfig, $pdoTemplate + [Environment]::NewLine, $pdoUtf8)
+        Write-Host "Created $pdoConfig"
     }
 
-    Write-Host "Installed cpdo to $cpdoInstallDir\cpdo.exe"
-    $cpdoUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    if (($cpdoUserPath -split ";") -notcontains $cpdoInstallDir) {
-        Write-Warning "$cpdoInstallDir is not in PATH. Add it with:"
-        Write-Host "[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';$cpdoInstallDir', 'User')"
+    Write-Host "Installed pdo to $pdoInstallDir\pdo.exe"
+    $pdoUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    if (($pdoUserPath -split ";") -notcontains $pdoInstallDir) {
+        Write-Warning "$pdoInstallDir is not in PATH. Add it with:"
+        Write-Host "[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';$pdoInstallDir', 'User')"
     }
-    Write-Host "Edit $cpdoConfig and set `$env:CPDO_GITHUB_PAT in your environment."
+    Write-Host "Edit $pdoConfig and set `$env:PDO_GITHUB_PAT in your environment."
 }
 finally {
-    Remove-Item -LiteralPath $cpdoTempDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $pdoTempDir -Recurse -Force -ErrorAction SilentlyContinue
 }

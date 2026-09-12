@@ -1,3 +1,3 @@
-module github.com/chping/cpdo
+module github.com/chping/pdo
 
 go 1.27

@@ -2,19 +2,19 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 if ($env:OS -ne "Windows_NT") {
-    throw "cpdo: uninstall.ps1 only supports Windows"
+    throw "pdo: uninstall.ps1 only supports Windows"
 }
 
-$cpdoInstallDir = Join-Path ([Environment]::GetFolderPath("LocalApplicationData")) "Programs\cpdo"
-$cpdoBinary = Join-Path $cpdoInstallDir "cpdo.exe"
-if (Test-Path -LiteralPath $cpdoBinary) {
-    Remove-Item -LiteralPath $cpdoBinary -Force
-    Write-Host "Removed $cpdoBinary"
-    Remove-Item -LiteralPath $cpdoInstallDir -Force -ErrorAction SilentlyContinue
+$pdoInstallDir = Join-Path ([Environment]::GetFolderPath("LocalApplicationData")) "Programs\pdo"
+$pdoBinary = Join-Path $pdoInstallDir "pdo.exe"
+if (Test-Path -LiteralPath $pdoBinary) {
+    Remove-Item -LiteralPath $pdoBinary -Force
+    Write-Host "Removed $pdoBinary"
+    Remove-Item -LiteralPath $pdoInstallDir -Force -ErrorAction SilentlyContinue
 }
 else {
-    Write-Host "cpdo is not installed at $cpdoBinary"
+    Write-Host "pdo is not installed at $pdoBinary"
 }
 
-$cpdoConfig = Join-Path ([Environment]::GetFolderPath("UserProfile")) ".config\cpdo\config.json"
-Write-Host "Kept configuration at $cpdoConfig"
+$pdoConfig = Join-Path ([Environment]::GetFolderPath("UserProfile")) ".config\pdo\config.json"
+Write-Host "Kept configuration at $pdoConfig"

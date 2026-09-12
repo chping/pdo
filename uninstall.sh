@@ -1,12 +1,12 @@
 #!/bin/sh
 set -eu
 
-cpdo_binary="$HOME/.local/bin/cpdo"
-if [ -e "$cpdo_binary" ] || [ -L "$cpdo_binary" ]; then
-  rm -f "$cpdo_binary"
-  echo "Removed $cpdo_binary"
+pdo_binary="$HOME/.local/bin/pdo"
+if [ -e "$pdo_binary" ] || [ -L "$pdo_binary" ]; then
+  rm -f "$pdo_binary"
+  echo "Removed $pdo_binary"
 else
-  echo "cpdo is not installed at $cpdo_binary"
+  echo "pdo is not installed at $pdo_binary"
 fi
 
-echo "Kept configuration at $HOME/.config/cpdo/config.json"
+echo "Kept configuration at $HOME/.config/pdo/config.json"
