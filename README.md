@@ -1,6 +1,6 @@
 # pdo
 
-跨平台个人命令行工具集。v0.1.1 支持同步 dotfiles，以及向 SSH config 中的主机批量部署公钥。
+跨平台个人命令行工具集，支持同步 dotfiles、跨设备剪贴板和文件中转，以及向 SSH config 中的主机批量部署公钥。
 
 ## 安装
 
@@ -27,6 +27,12 @@ irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
 ```json
 {
   "schema_version": 1,
+  "cloud_clipboard": {
+    "host": "https://clipboard-api.example.com/",
+    "prefix": "personal",
+    "username": "pdo",
+    "password_env": "PDO_CLOUD_CLIPBOARD_PASSWORD"
+  },
   "github": {
     "pat_env": "PDO_GITHUB_PAT"
   },
@@ -41,6 +47,16 @@ irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
     }
   }
 }
+```
+
+`cloud_clipboard` 段是可选的，只在调用四个跨设备命令时校验，旧配置无需迁移。`host` 必须是启用 HTTPS 的 Webdis 根地址；用户名和密码用于 HTTP Basic Auth，密码只从 `password_env` 指定的环境变量读取。Webdis 账号只需开放 `MSET`、`MGET`。反向代理及 Webdis 的请求体上限需高于 64 MiB。内容以明文保存在自管 Redis 中，不提供端到端加密。
+
+```sh
+export PDO_CLOUD_CLIPBOARD_PASSWORD="your-password"
+```
+
+```powershell
+$env:PDO_CLOUD_CLIPBOARD_PASSWORD = "your-password"
 ```
 
 dotfile 名称使用 kebab-case，并对应命令行的 `--<名称>`。`remote` 使用 GitHub 文件页面的标准链接 `https://github.com/OWNER/REPOSITORY/blob/BRANCH/PATH`；`local` 必须以 `~/` 开头或使用当前平台的绝对路径。pdo 会在内部将文件链接转换为 GitHub Contents API 请求。
@@ -68,6 +84,18 @@ pdo upload dotfiles
 pdo download dotfiles --ssh-config
 pdo upload dotfiles --ssh-config --git-config
 
+# 上传参数文本，或上传当前系统剪贴板中的图片/文本
+pdo copy "text"
+pdo copy
+
+# 下载最近的文本/图片，写入系统剪贴板并在终端输出
+pdo paste
+
+# 上传一个普通文件；下载到当前目录或指定的已存在目录
+pdo copy-file ./archive.zip
+pdo paste-file
+pdo paste-file ./downloads
+
 # 使用默认 ~/.ssh/config 部署指定公钥
 pdo copy-ssh-id --identity ~/.ssh/id_ed25519
 
@@ -81,6 +109,10 @@ pdo update
 
 pdo --help
 ```
+
+文本/图片与文件使用两个独立的最近一次槽位，单项最大 64 MiB，不自动过期。`copy-file` 和 `paste-file` 仅在 stderr 连接终端时显示传输进度；下载遇到同名文件会使用 `name (1).ext` 等新名称，不覆盖已有文件。
+
+macOS 使用系统 AppKit 剪贴板，Windows 使用 PowerShell/.NET。Linux Wayland 需要 `wl-clipboard`，X11 需要 `xclip`；剪贴板同时含图片和文本时优先使用图片。
 
 批量同步按配置名称排序执行；指定多个选择器时按参数顺序执行。某项失败不会阻止后续项目，最终只要有一项失败，命令就返回退出码 `1`。
 

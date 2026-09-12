@@ -63,6 +63,12 @@ if [ ! -e "$pdo_config" ] && [ ! -L "$pdo_config" ]; then
   cat >"$pdo_config" <<'EOF'
 {
   "schema_version": 1,
+  "cloud_clipboard": {
+    "host": "https://clipboard-api.example.com/",
+    "prefix": "personal",
+    "username": "pdo",
+    "password_env": "PDO_CLOUD_CLIPBOARD_PASSWORD"
+  },
   "github": {
     "pat_env": "PDO_GITHUB_PAT"
   },
@@ -82,4 +88,4 @@ case ":$PATH:" in
   *":$pdo_install_dir:"*) ;;
   *) echo "Add $pdo_install_dir to PATH before running pdo." ;;
 esac
-echo "Edit $pdo_config and set PDO_GITHUB_PAT in your environment."
+echo "Edit $pdo_config and set the configured password/token environment variables."

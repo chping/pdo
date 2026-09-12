@@ -52,6 +52,12 @@ try {
         $pdoTemplate = @'
 {
   "schema_version": 1,
+  "cloud_clipboard": {
+    "host": "https://clipboard-api.example.com/",
+    "prefix": "personal",
+    "username": "pdo",
+    "password_env": "PDO_CLOUD_CLIPBOARD_PASSWORD"
+  },
   "github": {
     "pat_env": "PDO_GITHUB_PAT"
   },
@@ -74,7 +80,7 @@ try {
         Write-Warning "$pdoInstallDir is not in PATH. Add it with:"
         Write-Host "[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';$pdoInstallDir', 'User')"
     }
-    Write-Host "Edit $pdoConfig and set `$env:PDO_GITHUB_PAT in your environment."
+    Write-Host "Edit $pdoConfig and set the configured password/token environment variables."
 }
 finally {
     Remove-Item -LiteralPath $pdoTempDir -Recurse -Force -ErrorAction SilentlyContinue

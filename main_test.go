@@ -7,14 +7,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -92,6 +96,326 @@ func TestLoadConfigSchemaAndUnknownSection(t *testing.T) {
 	if _, err := loadConfig(path); err == nil || !strings.Contains(err.Error(), "unsupported schema_version") {
 		t.Fatalf("error = %v", err)
 	}
+}
+
+func TestCloudClipboardConfigValidation(t *testing.T) {
+	t.Setenv("PDO_CLOUD_CLIPBOARD_PASSWORD", "secret")
+	valid := config{CloudClipboard: cloudClipboardConfig{
+		Host:        "https://clipboard.example.com/",
+		Prefix:      "personal",
+		Username:    "pdo",
+		PasswordEnv: "PDO_CLOUD_CLIPBOARD_PASSWORD",
+	}}
+	if client, err := valid.prepareCloudClipboard(); err != nil || client.password != "secret" {
+		t.Fatalf("client=%+v error=%v", client, err)
+	}
+	invalidHosts := []string{
+		"http://clipboard.example.com/",
+		"https://user@clipboard.example.com/",
+		"https://clipboard.example.com/webdis",
+		"https://clipboard.example.com/?query=1",
+		"https://clipboard.example.com/#fragment",
+	}
+	for _, host := range invalidHosts {
+		cfg := valid
+		cfg.CloudClipboard.Host = host
+		if _, err := cfg.prepareCloudClipboard(); err == nil {
+			t.Errorf("host %q was accepted", host)
+		}
+	}
+	for _, field := range []string{"host", "prefix", "username", "password_env"} {
+		cfg := valid
+		switch field {
+		case "host":
+			cfg.CloudClipboard.Host = ""
+		case "prefix":
+			cfg.CloudClipboard.Prefix = ""
+		case "username":
+			cfg.CloudClipboard.Username = ""
+		case "password_env":
+			cfg.CloudClipboard.PasswordEnv = ""
+		}
+		if _, err := cfg.prepareCloudClipboard(); err == nil {
+			t.Errorf("missing %s was accepted", field)
+		}
+	}
+	t.Setenv("PDO_CLOUD_CLIPBOARD_PASSWORD", "")
+	if _, err := valid.prepareCloudClipboard(); err == nil || !strings.Contains(err.Error(), "is empty") {
+		t.Fatalf("empty password error=%v", err)
+	}
+}
+
+func TestCloudClipboardCommandArguments(t *testing.T) {
+	invalid := [][]string{
+		{"copy", "one", "two"},
+		{"paste", "extra"},
+		{"copy-file"},
+		{"copy-file", "one", "two"},
+		{"paste-file", "one", "two"},
+	}
+	for _, args := range invalid {
+		var stdout, stderr bytes.Buffer
+		if code := run(args, &stdout, &stderr); code != 2 {
+			t.Errorf("args=%v code=%d stderr=%q", args, code, stderr.String())
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--help"}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "pdo copy-file") {
+		t.Fatalf("help code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestCloudClipboardTextAndImageCommands(t *testing.T) {
+	fixture := newWebdisFixture(t)
+	home := t.TempDir()
+	setHome(t, home)
+	writeCloudConfig(t, home, fixture.server.URL)
+	setCloudServer(t, fixture.server)
+
+	previousRead, previousWrite := readClipboard, writeClipboard
+	t.Cleanup(func() { readClipboard, writeClipboard = previousRead, previousWrite })
+	var writtenKind string
+	var writtenData []byte
+	writeClipboard = func(kind string, data []byte) error {
+		writtenKind = kind
+		writtenData = append([]byte(nil), data...)
+		return nil
+	}
+
+	text := "中文\n\"quoted\""
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"copy", text}, &stdout, &stderr); code != 0 || stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("copy code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if code := run([]string{"paste"}, &stdout, &stderr); code != 0 || stdout.String() != text || writtenKind != "text" || string(writtenData) != text {
+		t.Fatalf("paste code=%d stdout=%q stderr=%q kind=%q data=%q", code, stdout.String(), stderr.String(), writtenKind, writtenData)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	var imageData bytes.Buffer
+	if err := png.Encode(&imageData, image.NewRGBA(image.Rect(0, 0, 2, 3))); err != nil {
+		t.Fatal(err)
+	}
+	readClipboard = func() (string, []byte, error) { return "image-png", imageData.Bytes(), nil }
+	if code := run([]string{"copy"}, &stdout, &stderr); code != 0 || stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("image copy code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if code := run([]string{"paste"}, &stdout, &stderr); code != 0 || stdout.String() != fmt.Sprintf("image/png 2x3 %d bytes\n", imageData.Len()) || writtenKind != "image-png" || !bytes.Equal(writtenData, imageData.Bytes()) {
+		t.Fatalf("image paste code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+
+	fixture.set("personal:pdo:clipboard:type", []byte("image-png"))
+	fixture.set("personal:pdo:clipboard:data", []byte("not a png"))
+	writtenKind = "unchanged"
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"paste"}, &stdout, &stderr); code != 1 || writtenKind != "unchanged" || !strings.Contains(stderr.String(), "invalid PNG") {
+		t.Fatalf("invalid image code=%d stdout=%q stderr=%q kind=%q", code, stdout.String(), stderr.String(), writtenKind)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"copy", ""}, &stdout, &stderr); code != 0 {
+		t.Fatalf("empty copy code=%d stderr=%q", code, stderr.String())
+	}
+	writtenKind = ""
+	if code := run([]string{"paste"}, &stdout, &stderr); code != 0 || stdout.Len() != 0 || writtenKind != "text" || len(writtenData) != 0 {
+		t.Fatalf("empty paste code=%d stdout=%q stderr=%q kind=%q data=%q", code, stdout.String(), stderr.String(), writtenKind, writtenData)
+	}
+}
+
+func TestCloudClipboardFileCommands(t *testing.T) {
+	fixture := newWebdisFixture(t)
+	home := t.TempDir()
+	setHome(t, home)
+	writeCloudConfig(t, home, fixture.server.URL)
+	setCloudServer(t, fixture.server)
+
+	sourceDirectory := t.TempDir()
+	target := filepath.Join(sourceDirectory, "target.bin")
+	content := []byte{0, 1, 2, 3, 255}
+	if err := os.WriteFile(target, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(sourceDirectory, "資料 file.bin")
+	if runtime.GOOS == "windows" {
+		if err := os.Rename(target, source); err != nil {
+			t.Fatal(err)
+		}
+	} else if err := os.Symlink(target, source); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"copy-file", source}, &stdout, &stderr); code != 0 || stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("copy-file code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	destination := t.TempDir()
+	existing := filepath.Join(destination, filepath.Base(source))
+	if err := os.WriteFile(existing, []byte("existing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	if code := run([]string{"paste-file", destination}, &stdout, &stderr); code != 0 || stderr.Len() != 0 {
+		t.Fatalf("paste-file code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	first := filepath.Join(destination, "資料 file (1).bin")
+	if stdout.String() != first+"\n" {
+		t.Fatalf("saved path=%q want=%q", stdout.String(), first+"\n")
+	}
+	assertFileContent(t, first, content)
+	if runtime.GOOS != "windows" {
+		assertMode(t, first, 0o600)
+	}
+	stdout.Reset()
+	if code := run([]string{"paste-file", destination}, &stdout, &stderr); code != 0 {
+		t.Fatalf("second paste-file code=%d stderr=%q", code, stderr.String())
+	}
+	second := filepath.Join(destination, "資料 file (2).bin")
+	assertFileContent(t, second, content)
+
+	empty := filepath.Join(sourceDirectory, "empty.bin")
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"copy-file", empty}, &stdout, &stderr); code != 0 {
+		t.Fatalf("empty copy-file code=%d stderr=%q", code, stderr.String())
+	}
+	if code := run([]string{"paste-file", destination}, &stdout, &stderr); code != 0 {
+		t.Fatalf("empty paste-file code=%d stderr=%q", code, stderr.String())
+	}
+	assertFileContent(t, filepath.Join(destination, "empty.bin"), nil)
+	defaultDirectory := t.TempDir()
+	t.Chdir(defaultDirectory)
+	absoluteDefaultDirectory, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultDirectory = absoluteDefaultDirectory
+	stdout.Reset()
+	if code := run([]string{"paste-file"}, &stdout, &stderr); code != 0 || stdout.String() != filepath.Join(defaultDirectory, "empty.bin")+"\n" {
+		t.Fatalf("default paste-file code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	assertFileContent(t, filepath.Join(defaultDirectory, "empty.bin"), nil)
+
+	fixture.set("personal:pdo:file:name", []byte("../escape"))
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"paste-file", destination}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "invalid remote file name") {
+		t.Fatalf("invalid name code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+
+	large := filepath.Join(sourceDirectory, "large.bin")
+	largeFile, err := os.Create(large)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := largeFile.Truncate(maxClipboardPayload + 1); err != nil {
+		t.Fatal(err)
+	}
+	largeFile.Close()
+	stderr.Reset()
+	if code := run([]string{"copy-file", large}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "64 MiB") {
+		t.Fatalf("large file code=%d stderr=%q", code, stderr.String())
+	}
+	stderr.Reset()
+	if code := run([]string{"copy-file", sourceDirectory}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "not a regular file") {
+		t.Fatalf("directory code=%d stderr=%q", code, stderr.String())
+	}
+}
+
+func TestWebdisRESPValidationAndProgress(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		io.WriteString(writer, "*2\r\n$4\r\ntext\r\n$67108865\r\n")
+	}))
+	defer server.Close()
+	client := webdisClient{http: server.Client(), host: server.URL, username: "pdo", password: "secret"}
+	called := false
+	err := client.getPair("type", "data", func(string, int64, io.Reader) error {
+		called = true
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "64 MiB") || called {
+		t.Fatalf("oversized RESP error=%v called=%v", err, called)
+	}
+
+	var output bytes.Buffer
+	progress := newTransferProgress(&output, 4)
+	if _, err := progress.Write([]byte("test")); err != nil {
+		t.Fatal(err)
+	}
+	progress.finish()
+	if !strings.Contains(output.String(), "100.00%") || !strings.Contains(output.String(), "4 B/4 B") || !strings.HasSuffix(output.String(), "\n") {
+		t.Fatalf("progress=%q", output.String())
+	}
+}
+
+func TestClipboardPlatformCommands(t *testing.T) {
+	previousFind, previousRun := findCommand, runCommand
+	t.Cleanup(func() { findCommand, runCommand = previousFind, previousRun })
+	findCommand = func(name string) (string, error) { return name, nil }
+
+	t.Run("Wayland image priority and write MIME", func(t *testing.T) {
+		t.Setenv("WAYLAND_DISPLAY", "wayland-0")
+		var written []byte
+		runCommand = func(name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+			if args[0] == "--list-types" {
+				io.WriteString(stdout, "text/plain;charset=utf-8\nimage/png\n")
+				return nil
+			}
+			if args[0] == "--no-newline" {
+				stdout.Write([]byte("png"))
+				return nil
+			}
+			written, _ = io.ReadAll(stdin)
+			if strings.Join(args, " ") != "--type image/png" {
+				t.Errorf("write args=%v", args)
+			}
+			return nil
+		}
+		kind, data, err := linuxClipboardRead()
+		if err != nil || kind != "image-png" || string(data) != "png" {
+			t.Fatalf("kind=%q data=%q error=%v", kind, data, err)
+		}
+		if err := linuxClipboardWrite("image-png", []byte("png")); err != nil || string(written) != "png" {
+			t.Fatalf("written=%q error=%v", written, err)
+		}
+	})
+
+	t.Run("macOS raw text", func(t *testing.T) {
+		calls := 0
+		runCommand = func(name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+			calls++
+			if calls == 1 {
+				io.WriteString(stdout, "text\n")
+			} else {
+				io.WriteString(stdout, "line one\nline two")
+			}
+			return nil
+		}
+		kind, data, err := macOSClipboardRead()
+		if err != nil || kind != "text" || string(data) != "line one\nline two" {
+			t.Fatalf("kind=%q data=%q error=%v", kind, data, err)
+		}
+	})
+
+	t.Run("Windows temporary file", func(t *testing.T) {
+		runCommand = func(name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+			path := args[len(args)-1]
+			if err := os.WriteFile(path, []byte("windows text"), 0o600); err != nil {
+				return err
+			}
+			io.WriteString(stdout, "text")
+			return nil
+		}
+		kind, data, err := windowsClipboardRead()
+		if err != nil || kind != "text" || string(data) != "windows text" {
+			t.Fatalf("kind=%q data=%q error=%v", kind, data, err)
+		}
+	})
 }
 
 func TestParseRemoteRejectsInvalidURLs(t *testing.T) {
@@ -1195,5 +1519,123 @@ func assertMode(t *testing.T, path string, want os.FileMode) {
 	}
 	if info.Mode().Perm() != want {
 		t.Fatalf("%s mode = %o, want %o", path, info.Mode().Perm(), want)
+	}
+}
+
+type webdisFixture struct {
+	server *httptest.Server
+	mutex  sync.Mutex
+	values map[string][]byte
+}
+
+func newWebdisFixture(t *testing.T) *webdisFixture {
+	t.Helper()
+	fixture := &webdisFixture{values: make(map[string][]byte)}
+	fixture.server = httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		username, password, ok := request.BasicAuth()
+		if !ok || username != "pdo" || password != "secret" {
+			http.Error(writer, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		escapedPath := strings.TrimPrefix(request.URL.EscapedPath(), "/")
+		parts := strings.Split(escapedPath, "/")
+		if len(parts) == 0 {
+			http.Error(writer, "bad request", http.StatusBadRequest)
+			return
+		}
+		parts[len(parts)-1] = strings.TrimSuffix(parts[len(parts)-1], ".raw")
+		for index := range parts {
+			decoded, err := url.PathUnescape(parts[index])
+			if err != nil {
+				http.Error(writer, "bad escape", http.StatusBadRequest)
+				return
+			}
+			parts[index] = decoded
+		}
+		switch parts[0] {
+		case "MSET":
+			if request.Method != http.MethodPut || len(parts) != 4 {
+				http.Error(writer, "bad MSET", http.StatusBadRequest)
+				return
+			}
+			data, err := io.ReadAll(request.Body)
+			if err != nil {
+				http.Error(writer, err.Error(), http.StatusBadRequest)
+				return
+			}
+			fixture.mutex.Lock()
+			fixture.values[parts[1]] = []byte(parts[2])
+			fixture.values[parts[3]] = data
+			fixture.mutex.Unlock()
+			io.WriteString(writer, "+OK\r\n")
+		case "MGET":
+			if request.Method != http.MethodGet || len(parts) != 3 {
+				http.Error(writer, "bad MGET", http.StatusBadRequest)
+				return
+			}
+			fixture.mutex.Lock()
+			values := [][]byte{
+				append([]byte(nil), fixture.values[parts[1]]...),
+				append([]byte(nil), fixture.values[parts[2]]...),
+			}
+			_, firstPresent := fixture.values[parts[1]]
+			_, secondPresent := fixture.values[parts[2]]
+			fixture.mutex.Unlock()
+			io.WriteString(writer, "*2\r\n")
+			for index, value := range values {
+				present := firstPresent
+				if index == 1 {
+					present = secondPresent
+				}
+				if !present {
+					io.WriteString(writer, "$-1\r\n")
+					continue
+				}
+				fmt.Fprintf(writer, "$%d\r\n", len(value))
+				writer.Write(value)
+				io.WriteString(writer, "\r\n")
+			}
+		default:
+			http.Error(writer, "unknown command", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(fixture.server.Close)
+	return fixture
+}
+
+func (fixture *webdisFixture) set(key string, value []byte) {
+	fixture.mutex.Lock()
+	fixture.values[key] = append([]byte(nil), value...)
+	fixture.mutex.Unlock()
+}
+
+func setCloudServer(t *testing.T, server *httptest.Server) {
+	t.Helper()
+	previous := cloudHTTPClient
+	cloudHTTPClient = func() *http.Client { return server.Client() }
+	t.Cleanup(func() { cloudHTTPClient = previous })
+}
+
+func writeCloudConfig(t *testing.T, home, host string) {
+	t.Helper()
+	t.Setenv("PDO_CLOUD_CLIPBOARD_PASSWORD", "secret")
+	configDirectory := filepath.Join(home, ".config", "pdo")
+	if err := os.MkdirAll(configDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(config{
+		SchemaVersion: 1,
+		CloudClipboard: cloudClipboardConfig{
+			Host:        host,
+			Prefix:      "personal",
+			Username:    "pdo",
+			PasswordEnv: "PDO_CLOUD_CLIPBOARD_PASSWORD",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDirectory, "config.json"), data, 0o600); err != nil {
+		t.Fatal(err)
 	}
 }

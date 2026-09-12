@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image/png"
 	"io"
 	"net/http"
 	"net/url"
@@ -19,15 +20,21 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
 	supportedSchemaVersion = 1
 	maxAPIResponse         = 4 << 20
 	maxUpdateBinary        = 100 << 20
+	maxClipboardPayload    = 64 << 20
 	usage                  = `Usage:
   pdo download dotfiles [--<name> ...]
   pdo upload dotfiles [--<name> ...]
+  pdo copy ["text"]
+  pdo paste
+  pdo copy-file <file_path>
+  pdo paste-file [save_path]
   pdo copy-ssh-id --identity=<path> [--config=<path>]
   pdo update [--check]
   pdo version`
@@ -49,12 +56,33 @@ var (
 		command.Stderr = stderr
 		return command.Run()
 	}
+	readClipboard   = systemClipboardRead
+	writeClipboard  = systemClipboardWrite
+	cloudHTTPClient = func() *http.Client {
+		return &http.Client{Timeout: 10 * time.Minute}
+	}
+	isTerminal = func(writer io.Writer) bool {
+		file, ok := writer.(*os.File)
+		if !ok {
+			return false
+		}
+		info, err := file.Stat()
+		return err == nil && info.Mode()&os.ModeCharDevice != 0
+	}
 )
 
 type config struct {
-	SchemaVersion int                      `json:"schema_version"`
-	GitHub        githubConfig             `json:"github"`
-	Dotfiles      map[string]dotfileConfig `json:"dotfiles"`
+	SchemaVersion  int                      `json:"schema_version"`
+	GitHub         githubConfig             `json:"github"`
+	Dotfiles       map[string]dotfileConfig `json:"dotfiles"`
+	CloudClipboard cloudClipboardConfig     `json:"cloud_clipboard"`
+}
+
+type cloudClipboardConfig struct {
+	Host        string `json:"host"`
+	Prefix      string `json:"prefix"`
+	Username    string `json:"username"`
+	PasswordEnv string `json:"password_env"`
 }
 
 type githubConfig struct {
@@ -80,6 +108,27 @@ type githubClient struct {
 	branch     string
 	path       string
 	message    string
+}
+
+type webdisClient struct {
+	http     *http.Client
+	host     string
+	prefix   string
+	username string
+	password string
+}
+
+type transferProgress struct {
+	output io.Writer
+	total  int64
+	done   int64
+	start  time.Time
+	last   time.Time
+}
+
+type limitedBuffer struct {
+	bytes.Buffer
+	limit int
 }
 
 type githubFile struct {
@@ -166,6 +215,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
 		fmt.Fprintln(stdout, usage)
+		return 0
+	}
+	if len(args) > 0 && (args[0] == "copy" || args[0] == "paste" || args[0] == "copy-file" || args[0] == "paste-file") {
+		valid := (args[0] == "copy" && len(args) <= 2) ||
+			(args[0] == "paste" && len(args) == 1) ||
+			(args[0] == "copy-file" && len(args) == 2) ||
+			(args[0] == "paste-file" && len(args) <= 2)
+		if !valid {
+			fmt.Fprintln(stderr, usage)
+			return 2
+		}
+		if err := runCloudClipboard(args, stdout, stderr); err != nil {
+			fmt.Fprintf(stderr, "pdo: %s: %v\n", args[0], err)
+			return 1
+		}
 		return 0
 	}
 	if len(args) >= 1 && args[0] == "copy-ssh-id" {
@@ -303,6 +367,754 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	return 0
 }
+
+func runCloudClipboard(args []string, stdout, stderr io.Writer) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("find home directory: %w", err)
+	}
+	cfg, err := loadConfig(filepath.Join(home, ".config", "pdo", "config.json"))
+	if err != nil {
+		return err
+	}
+	client, err := cfg.prepareCloudClipboard()
+	if err != nil {
+		return err
+	}
+
+	switch args[0] {
+	case "copy":
+		kind := "text"
+		var data []byte
+		if len(args) == 2 {
+			data = []byte(args[1])
+		} else {
+			kind, data, err = readClipboard()
+			if err != nil {
+				return err
+			}
+		}
+		if _, _, err := validateClipboardPayload(kind, data); err != nil {
+			return err
+		}
+		return client.putPair(client.prefix+":pdo:clipboard:type", kind, client.prefix+":pdo:clipboard:data", bytes.NewReader(data), int64(len(data)))
+
+	case "paste":
+		var kind string
+		var data []byte
+		err := client.getPair(client.prefix+":pdo:clipboard:type", client.prefix+":pdo:clipboard:data", func(metadata string, size int64, reader io.Reader) error {
+			kind = metadata
+			data = make([]byte, size)
+			_, err := io.ReadFull(reader, data)
+			return err
+		})
+		if err != nil {
+			return err
+		}
+		width, height, err := validateClipboardPayload(kind, data)
+		if err != nil {
+			return err
+		}
+		if err := writeClipboard(kind, data); err != nil {
+			return err
+		}
+		if kind == "text" {
+			_, err = stdout.Write(data)
+		} else {
+			_, err = fmt.Fprintf(stdout, "image/png %dx%d %d bytes\n", width, height, len(data))
+		}
+		return err
+
+	case "copy-file":
+		file, err := os.Open(args[1])
+		if err != nil {
+			return fmt.Errorf("open file: %w", err)
+		}
+		defer file.Close()
+		info, err := file.Stat()
+		if err != nil {
+			return fmt.Errorf("inspect file: %w", err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("path is not a regular file: %s", args[1])
+		}
+		if info.Size() > maxClipboardPayload {
+			return fmt.Errorf("file exceeds 64 MiB limit")
+		}
+		name := filepath.Base(args[1])
+		if !utf8.ValidString(name) {
+			return fmt.Errorf("file name is not valid UTF-8")
+		}
+		var body io.Reader = file
+		var progress *transferProgress
+		if isTerminal(stderr) {
+			progress = newTransferProgress(stderr, info.Size())
+			body = io.TeeReader(file, progress)
+			defer progress.finish()
+		}
+		return client.putPair(client.prefix+":pdo:file:name", name, client.prefix+":pdo:file:data", body, info.Size())
+
+	case "paste-file":
+		directory := "."
+		if len(args) == 2 {
+			directory = args[1]
+		}
+		directory, err = filepath.Abs(directory)
+		if err != nil {
+			return fmt.Errorf("resolve save path: %w", err)
+		}
+		info, err := os.Stat(directory)
+		if err != nil {
+			return fmt.Errorf("inspect save path: %w", err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("save path is not a directory: %s", directory)
+		}
+
+		var savedPath string
+		fileComplete := false
+		err = client.getPair(client.prefix+":pdo:file:name", client.prefix+":pdo:file:data", func(name string, size int64, reader io.Reader) error {
+			if err := validateDownloadedFileName(name); err != nil {
+				return err
+			}
+			file, path, err := createDownloadFile(directory, name)
+			if err != nil {
+				return err
+			}
+			savedPath = path
+			ok := false
+			defer func() {
+				file.Close()
+				if !ok {
+					os.Remove(path)
+				}
+			}()
+			if runtime.GOOS != "windows" {
+				if err := file.Chmod(0o600); err != nil {
+					return fmt.Errorf("set file permissions: %w", err)
+				}
+			}
+			var progress *transferProgress
+			writer := io.Writer(file)
+			if isTerminal(stderr) {
+				progress = newTransferProgress(stderr, size)
+				writer = io.MultiWriter(file, progress)
+				defer progress.finish()
+			}
+			written, err := io.Copy(writer, reader)
+			if err != nil {
+				return fmt.Errorf("write downloaded file: %w", err)
+			}
+			if written != size {
+				return fmt.Errorf("downloaded file length is %d, expected %d", written, size)
+			}
+			if err := file.Sync(); err != nil {
+				return fmt.Errorf("sync downloaded file: %w", err)
+			}
+			if err := file.Close(); err != nil {
+				return fmt.Errorf("close downloaded file: %w", err)
+			}
+			ok = true
+			fileComplete = true
+			return nil
+		})
+		if err != nil {
+			if fileComplete {
+				if removeErr := os.Remove(savedPath); removeErr != nil && !os.IsNotExist(removeErr) {
+					return fmt.Errorf("%v; remove incomplete file: %v", err, removeErr)
+				}
+			}
+			return err
+		}
+		_, err = fmt.Fprintln(stdout, savedPath)
+		return err
+	}
+	return nil
+}
+
+func (cfg config) prepareCloudClipboard() (*webdisClient, error) {
+	item := cfg.CloudClipboard
+	if item.Host == "" || item.Prefix == "" || item.Username == "" || item.PasswordEnv == "" {
+		return nil, fmt.Errorf("cloud_clipboard.host, prefix, username, and password_env are required")
+	}
+	parsed, err := url.Parse(item.Host)
+	if err != nil {
+		return nil, fmt.Errorf("cloud_clipboard.host: invalid URL: %w", err)
+	}
+	if parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(item.Host, "#") || (parsed.Path != "" && parsed.Path != "/") {
+		return nil, fmt.Errorf("cloud_clipboard.host must be an HTTPS Webdis root URL without credentials, path, query, or fragment")
+	}
+	password := os.Getenv(item.PasswordEnv)
+	if password == "" {
+		return nil, fmt.Errorf("environment variable %s is empty", item.PasswordEnv)
+	}
+	httpClient := cloudHTTPClient()
+	if httpClient.CheckRedirect == nil {
+		httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
+	return &webdisClient{
+		http:     httpClient,
+		host:     strings.TrimRight(item.Host, "/"),
+		prefix:   item.Prefix,
+		username: item.Username,
+		password: password,
+	}, nil
+}
+
+func (client *webdisClient) putPair(metadataKey, metadata, dataKey string, body io.Reader, size int64) error {
+	request, err := http.NewRequest(http.MethodPut, client.endpoint("MSET", metadataKey, metadata, dataKey), body)
+	if err != nil {
+		return fmt.Errorf("create Webdis request: %w", err)
+	}
+	request.ContentLength = size
+	request.Header.Set("Content-Type", "application/octet-stream")
+	request.Header.Set("User-Agent", "pdo")
+	request.SetBasicAuth(client.username, client.password)
+	response, err := client.http.Do(request)
+	if err != nil {
+		return fmt.Errorf("Webdis request failed: %w", err)
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 4097))
+	if err != nil {
+		return fmt.Errorf("read Webdis response: %w", err)
+	}
+	if len(responseBody) > 4096 {
+		return fmt.Errorf("Webdis response is too large")
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("Webdis returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody)))
+	}
+	if string(responseBody) != "+OK\r\n" {
+		return fmt.Errorf("invalid Webdis MSET response")
+	}
+	return nil
+}
+
+func (client *webdisClient) getPair(metadataKey, dataKey string, consume func(string, int64, io.Reader) error) error {
+	request, err := http.NewRequest(http.MethodGet, client.endpoint("MGET", metadataKey, dataKey), nil)
+	if err != nil {
+		return fmt.Errorf("create Webdis request: %w", err)
+	}
+	request.Header.Set("User-Agent", "pdo")
+	request.SetBasicAuth(client.username, client.password)
+	response, err := client.http.Do(request)
+	if err != nil {
+		return fmt.Errorf("Webdis request failed: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return fmt.Errorf("Webdis returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody)))
+	}
+
+	reader := bufio.NewReaderSize(response.Body, 4096)
+	line, err := readRESPLine(reader)
+	if err != nil || line != "*2" {
+		return fmt.Errorf("invalid Webdis MGET response")
+	}
+	metadataSize, present, err := readRESPBulkLength(reader, 4096)
+	if err != nil {
+		return err
+	}
+	if !present {
+		return fmt.Errorf("cloud slot is empty")
+	}
+	metadata := make([]byte, metadataSize)
+	if _, err := io.ReadFull(reader, metadata); err != nil {
+		return fmt.Errorf("read Webdis metadata: %w", err)
+	}
+	if err := readRESPCRLF(reader); err != nil {
+		return err
+	}
+	dataSize, present, err := readRESPBulkLength(reader, maxClipboardPayload)
+	if err != nil {
+		return err
+	}
+	if !present {
+		return fmt.Errorf("cloud slot is empty")
+	}
+	limited := &io.LimitedReader{R: reader, N: dataSize}
+	if err := consume(string(metadata), dataSize, limited); err != nil {
+		return err
+	}
+	if limited.N != 0 {
+		return fmt.Errorf("Webdis payload length is shorter than declared")
+	}
+	if err := readRESPCRLF(reader); err != nil {
+		return err
+	}
+	if _, err := reader.ReadByte(); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("invalid trailing data in Webdis response")
+		}
+		return fmt.Errorf("read Webdis response: %w", err)
+	}
+	return nil
+}
+
+func (client *webdisClient) endpoint(command string, arguments ...string) string {
+	parts := make([]string, 1, len(arguments)+1)
+	parts[0] = command
+	for _, argument := range arguments {
+		parts = append(parts, url.PathEscape(argument))
+	}
+	return client.host + "/" + strings.Join(parts, "/") + ".raw"
+}
+
+func readRESPLine(reader *bufio.Reader) (string, error) {
+	line, err := reader.ReadSlice('\n')
+	if err != nil {
+		return "", fmt.Errorf("read Webdis RESP line: %w", err)
+	}
+	if len(line) < 2 || line[len(line)-2] != '\r' {
+		return "", fmt.Errorf("invalid Webdis RESP line")
+	}
+	return string(line[:len(line)-2]), nil
+}
+
+func readRESPBulkLength(reader *bufio.Reader, limit int64) (int64, bool, error) {
+	line, err := readRESPLine(reader)
+	if err != nil {
+		return 0, false, err
+	}
+	if !strings.HasPrefix(line, "$") {
+		return 0, false, fmt.Errorf("invalid Webdis RESP bulk value")
+	}
+	size, err := strconv.ParseInt(line[1:], 10, 64)
+	if err != nil || size < -1 {
+		return 0, false, fmt.Errorf("invalid Webdis RESP bulk length")
+	}
+	if size == -1 {
+		return 0, false, nil
+	}
+	if size > limit {
+		if limit == maxClipboardPayload {
+			return 0, false, fmt.Errorf("Webdis payload exceeds 64 MiB limit")
+		}
+		return 0, false, fmt.Errorf("Webdis metadata exceeds %d-byte limit", limit)
+	}
+	return size, true, nil
+}
+
+func readRESPCRLF(reader *bufio.Reader) error {
+	var delimiter [2]byte
+	if _, err := io.ReadFull(reader, delimiter[:]); err != nil {
+		return fmt.Errorf("read Webdis RESP delimiter: %w", err)
+	}
+	if delimiter != [2]byte{'\r', '\n'} {
+		return fmt.Errorf("invalid Webdis RESP delimiter")
+	}
+	return nil
+}
+
+func validateClipboardPayload(kind string, data []byte) (int, int, error) {
+	if len(data) > maxClipboardPayload {
+		return 0, 0, fmt.Errorf("clipboard payload exceeds 64 MiB limit")
+	}
+	if kind == "text" {
+		if !utf8.Valid(data) {
+			return 0, 0, fmt.Errorf("clipboard text is not valid UTF-8")
+		}
+		return 0, 0, nil
+	}
+	if kind != "image-png" {
+		return 0, 0, fmt.Errorf("unsupported clipboard type %q", kind)
+	}
+	image, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid PNG image: %w", err)
+	}
+	bounds := image.Bounds()
+	return bounds.Dx(), bounds.Dy(), nil
+}
+
+func validateDownloadedFileName(name string) error {
+	if name == "" || name == "." || name == ".." || !utf8.ValidString(name) || strings.ContainsAny(name, "/\\\x00") {
+		return fmt.Errorf("invalid remote file name %q", name)
+	}
+	if runtime.GOOS == "windows" {
+		if strings.ContainsAny(name, "<>:\"|?*") || strings.HasSuffix(name, " ") || strings.HasSuffix(name, ".") {
+			return fmt.Errorf("invalid remote file name %q", name)
+		}
+		for _, character := range name {
+			if character < 32 {
+				return fmt.Errorf("invalid remote file name %q", name)
+			}
+		}
+		base := strings.ToUpper(strings.SplitN(name, ".", 2)[0])
+		if base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" ||
+			(len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) && base[3] >= '1' && base[3] <= '9') {
+			return fmt.Errorf("invalid remote file name %q", name)
+		}
+	}
+	return nil
+}
+
+func createDownloadFile(directory, name string) (*os.File, string, error) {
+	extension := filepath.Ext(name)
+	if extension == name {
+		extension = ""
+	}
+	stem := strings.TrimSuffix(name, extension)
+	for index := 0; ; index++ {
+		candidate := name
+		if index > 0 {
+			candidate = fmt.Sprintf("%s (%d)%s", stem, index, extension)
+		}
+		path := filepath.Join(directory, candidate)
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			return file, path, nil
+		}
+		if !os.IsExist(err) {
+			return nil, "", fmt.Errorf("create destination file: %w", err)
+		}
+	}
+}
+
+func newTransferProgress(output io.Writer, total int64) *transferProgress {
+	return &transferProgress{output: output, total: total, start: time.Now()}
+}
+
+func (progress *transferProgress) Write(data []byte) (int, error) {
+	progress.done += int64(len(data))
+	progress.render(false)
+	return len(data), nil
+}
+
+func (progress *transferProgress) finish() {
+	progress.render(true)
+	fmt.Fprintln(progress.output)
+}
+
+func (progress *transferProgress) render(force bool) {
+	now := time.Now()
+	if !force && !progress.last.IsZero() && now.Sub(progress.last) < 100*time.Millisecond {
+		return
+	}
+	percent := 100.0
+	if progress.total > 0 {
+		percent = float64(progress.done) * 100 / float64(progress.total)
+	}
+	elapsed := now.Sub(progress.start).Seconds()
+	rate := float64(progress.done)
+	if elapsed > 0 {
+		rate /= elapsed
+	}
+	fmt.Fprintf(progress.output, "\r%6.2f%% %s/%s %s/s", percent, formatBytes(progress.done), formatBytes(progress.total), formatBytes(int64(rate)))
+	progress.last = now
+}
+
+func formatBytes(size int64) string {
+	if size < 1024 {
+		return fmt.Sprintf("%d B", size)
+	}
+	if size < 1024*1024 {
+		return fmt.Sprintf("%.1f KiB", float64(size)/1024)
+	}
+	return fmt.Sprintf("%.1f MiB", float64(size)/(1024*1024))
+}
+
+func systemClipboardRead() (string, []byte, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		return macOSClipboardRead()
+	case "windows":
+		return windowsClipboardRead()
+	case "linux":
+		return linuxClipboardRead()
+	default:
+		return "", nil, fmt.Errorf("system clipboard is not supported on %s", runtime.GOOS)
+	}
+}
+
+func systemClipboardWrite(kind string, data []byte) error {
+	switch runtime.GOOS {
+	case "darwin":
+		return macOSClipboardWrite(kind, data)
+	case "windows":
+		return windowsClipboardWrite(kind, data)
+	case "linux":
+		return linuxClipboardWrite(kind, data)
+	default:
+		return fmt.Errorf("system clipboard is not supported on %s", runtime.GOOS)
+	}
+}
+
+func linuxClipboardRead() (string, []byte, error) {
+	if os.Getenv("WAYLAND_DISPLAY") != "" {
+		command, err := findCommand("wl-paste")
+		if err != nil {
+			return "", nil, fmt.Errorf("wl-paste is required; install wl-clipboard")
+		}
+		types, err := clipboardCommandOutput(command, []string{"--list-types"}, nil)
+		if err != nil {
+			return "", nil, err
+		}
+		if hasClipboardType(types, "image/png") {
+			data, err := clipboardCommandOutput(command, []string{"--no-newline", "--type", "image/png"}, nil)
+			return "image-png", data, err
+		}
+		for _, mimeType := range []string{"text/plain;charset=utf-8", "text/plain"} {
+			if hasClipboardType(types, mimeType) {
+				data, err := clipboardCommandOutput(command, []string{"--no-newline", "--type", mimeType}, nil)
+				return "text", data, err
+			}
+		}
+		return "", nil, fmt.Errorf("system clipboard does not contain text or an image")
+	}
+
+	command, err := findCommand("xclip")
+	if err != nil {
+		return "", nil, fmt.Errorf("xclip is required; install xclip")
+	}
+	types, err := clipboardCommandOutput(command, []string{"-selection", "clipboard", "-target", "TARGETS", "-out"}, nil)
+	if err != nil {
+		return "", nil, err
+	}
+	if hasClipboardType(types, "image/png") {
+		data, err := clipboardCommandOutput(command, []string{"-selection", "clipboard", "-target", "image/png", "-out"}, nil)
+		return "image-png", data, err
+	}
+	for _, mimeType := range []string{"text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING"} {
+		if hasClipboardType(types, mimeType) {
+			data, err := clipboardCommandOutput(command, []string{"-selection", "clipboard", "-target", mimeType, "-out"}, nil)
+			return "text", data, err
+		}
+	}
+	return "", nil, fmt.Errorf("system clipboard does not contain text or an image")
+}
+
+func linuxClipboardWrite(kind string, data []byte) error {
+	if os.Getenv("WAYLAND_DISPLAY") != "" {
+		command, err := findCommand("wl-copy")
+		if err != nil {
+			return fmt.Errorf("wl-copy is required; install wl-clipboard")
+		}
+		mimeType := "text/plain;charset=utf-8"
+		if kind == "image-png" {
+			mimeType = "image/png"
+		}
+		_, err = clipboardCommandOutput(command, []string{"--type", mimeType}, bytes.NewReader(data))
+		return err
+	}
+	command, err := findCommand("xclip")
+	if err != nil {
+		return fmt.Errorf("xclip is required; install xclip")
+	}
+	mimeType := "text/plain;charset=utf-8"
+	if kind == "image-png" {
+		mimeType = "image/png"
+	}
+	_, err = clipboardCommandOutput(command, []string{"-selection", "clipboard", "-target", mimeType, "-in"}, bytes.NewReader(data))
+	return err
+}
+
+func macOSClipboardRead() (string, []byte, error) {
+	command, err := findCommand("osascript")
+	if err != nil {
+		return "", nil, fmt.Errorf("osascript is required")
+	}
+	kindOutput, err := clipboardCommandOutput(command, []string{"-l", "JavaScript", "-e", macOSClipboardTypeScript}, nil)
+	if err != nil {
+		return "", nil, err
+	}
+	kind := strings.TrimSpace(string(kindOutput))
+	var script string
+	if kind == "image-png" {
+		script = macOSClipboardReadImageScript
+	} else if kind == "text" {
+		script = macOSClipboardReadTextScript
+	} else {
+		return "", nil, fmt.Errorf("system clipboard returned unsupported type %q", kind)
+	}
+	data, err := clipboardCommandOutput(command, []string{"-l", "JavaScript", "-e", script}, nil)
+	return kind, data, err
+}
+
+func macOSClipboardWrite(kind string, data []byte) error {
+	command, err := findCommand("osascript")
+	if err != nil {
+		return fmt.Errorf("osascript is required")
+	}
+	script := macOSClipboardWriteTextScript
+	if kind == "image-png" {
+		script = macOSClipboardWriteImageScript
+	}
+	_, err = clipboardCommandOutput(command, []string{"-l", "JavaScript", "-e", script}, bytes.NewReader(data))
+	return err
+}
+
+func windowsClipboardRead() (string, []byte, error) {
+	command, err := findCommand("powershell.exe")
+	if err != nil {
+		return "", nil, fmt.Errorf("PowerShell is required")
+	}
+	temporary, err := os.CreateTemp("", "pdo-clipboard-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("create clipboard temporary file: %w", err)
+	}
+	path := temporary.Name()
+	temporary.Close()
+	defer os.Remove(path)
+	kindOutput, err := clipboardCommandOutput(command, []string{"-NoProfile", "-NonInteractive", "-STA", "-Command", windowsClipboardReadScript, path}, nil)
+	if err != nil {
+		return "", nil, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", nil, fmt.Errorf("inspect clipboard temporary file: %w", err)
+	}
+	if info.Size() > maxClipboardPayload {
+		return "", nil, fmt.Errorf("clipboard payload exceeds 64 MiB limit")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", nil, fmt.Errorf("read clipboard temporary file: %w", err)
+	}
+	return strings.TrimSpace(string(kindOutput)), data, nil
+}
+
+func windowsClipboardWrite(kind string, data []byte) error {
+	command, err := findCommand("powershell.exe")
+	if err != nil {
+		return fmt.Errorf("PowerShell is required")
+	}
+	temporary, err := os.CreateTemp("", "pdo-clipboard-*")
+	if err != nil {
+		return fmt.Errorf("create clipboard temporary file: %w", err)
+	}
+	path := temporary.Name()
+	defer os.Remove(path)
+	if _, err := temporary.Write(data); err != nil {
+		temporary.Close()
+		return fmt.Errorf("write clipboard temporary file: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close clipboard temporary file: %w", err)
+	}
+	_, err = clipboardCommandOutput(command, []string{"-NoProfile", "-NonInteractive", "-STA", "-Command", windowsClipboardWriteScript, path, kind}, nil)
+	return err
+}
+
+func clipboardCommandOutput(name string, arguments []string, input io.Reader) ([]byte, error) {
+	output := &limitedBuffer{limit: maxClipboardPayload + 1}
+	var commandError bytes.Buffer
+	err := runCommand(name, arguments, input, output, &commandError)
+	if output.Len() > maxClipboardPayload {
+		return nil, fmt.Errorf("clipboard payload exceeds 64 MiB limit")
+	}
+	if err != nil {
+		message := strings.TrimSpace(commandError.String())
+		if message != "" {
+			return nil, fmt.Errorf("clipboard command failed: %s", message)
+		}
+		return nil, fmt.Errorf("clipboard command failed: %w", err)
+	}
+	return output.Bytes(), nil
+}
+
+func (buffer *limitedBuffer) Write(data []byte) (int, error) {
+	remaining := buffer.limit - buffer.Len()
+	if remaining <= 0 {
+		return 0, fmt.Errorf("output limit exceeded")
+	}
+	if len(data) > remaining {
+		written, _ := buffer.Buffer.Write(data[:remaining])
+		return written, fmt.Errorf("output limit exceeded")
+	}
+	return buffer.Buffer.Write(data)
+}
+
+func hasClipboardType(output []byte, target string) bool {
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.TrimSpace(line) == target {
+			return true
+		}
+	}
+	return false
+}
+
+const macOSClipboardTypeScript = `ObjC.import('AppKit')
+function run() {
+    const pasteboard = $.NSPasteboard.generalPasteboard
+    const imageType = ObjC.unwrap(pasteboard.availableTypeFromArray(['public.png', 'public.tiff']))
+    if (imageType) return 'image-png'
+    const textType = ObjC.unwrap(pasteboard.availableTypeFromArray(['public.utf8-plain-text', 'public.utf16-external-plain-text', 'public.plain-text']))
+    if (textType) return 'text'
+    throw new Error('clipboard does not contain text or an image')
+}`
+
+const macOSClipboardReadImageScript = `ObjC.import('AppKit')
+ObjC.import('Foundation')
+function run() {
+    const pasteboard = $.NSPasteboard.generalPasteboard
+    const pngType = ObjC.unwrap(pasteboard.availableTypeFromArray(['public.png']))
+    let data
+    if (pngType) {
+        data = pasteboard.dataForType(pngType)
+    } else {
+        const image = $.NSImage.alloc.initWithPasteboard(pasteboard)
+        const representation = $.NSBitmapImageRep.imageRepWithData(image.TIFFRepresentation)
+        data = representation.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $.NSDictionary.dictionary)
+    }
+    $.NSFileHandle.fileHandleWithStandardOutput.writeData(data)
+}`
+
+const macOSClipboardReadTextScript = `ObjC.import('AppKit')
+ObjC.import('Foundation')
+function run() {
+    const pasteboard = $.NSPasteboard.generalPasteboard
+    const type = pasteboard.availableTypeFromArray(['public.utf8-plain-text', 'public.utf16-external-plain-text', 'public.plain-text'])
+    const value = pasteboard.stringForType(type)
+    if (!value) throw new Error('clipboard text cannot be read')
+    $.NSFileHandle.fileHandleWithStandardOutput.writeData(value.dataUsingEncoding($.NSUTF8StringEncoding))
+}`
+
+const macOSClipboardWriteTextScript = `ObjC.import('AppKit')
+ObjC.import('Foundation')
+function run() {
+    const data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile
+    const value = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding)
+    const pasteboard = $.NSPasteboard.generalPasteboard
+    pasteboard.clearContents
+    if (!pasteboard.setStringForType(value, 'public.utf8-plain-text')) throw new Error('clipboard text cannot be written')
+}`
+
+const macOSClipboardWriteImageScript = `ObjC.import('AppKit')
+ObjC.import('Foundation')
+function run() {
+    const data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile
+    const pasteboard = $.NSPasteboard.generalPasteboard
+    pasteboard.clearContents
+    if (!pasteboard.setDataForType(data, 'public.png')) throw new Error('clipboard image cannot be written')
+}`
+
+const windowsClipboardReadScript = `Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$path = $args[0]
+if ([Windows.Forms.Clipboard]::ContainsImage()) {
+    $image = [Windows.Forms.Clipboard]::GetImage()
+    try { $image.Save($path, [Drawing.Imaging.ImageFormat]::Png) } finally { $image.Dispose() }
+    [Console]::Out.Write('image-png')
+} elseif ([Windows.Forms.Clipboard]::ContainsText()) {
+    [IO.File]::WriteAllText($path, [Windows.Forms.Clipboard]::GetText(), (New-Object Text.UTF8Encoding($false)))
+    [Console]::Out.Write('text')
+} else {
+    throw 'clipboard does not contain text or an image'
+}`
+
+const windowsClipboardWriteScript = `Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$path = $args[0]
+if ($args[1] -eq 'image-png') {
+    $image = [Drawing.Image]::FromFile($path)
+    try { [Windows.Forms.Clipboard]::SetImage($image) } finally { $image.Dispose() }
+} else {
+    $text = [IO.File]::ReadAllText($path, (New-Object Text.UTF8Encoding($false, $true)))
+    [Windows.Forms.Clipboard]::SetDataObject($text, $true)
+}`
 
 func parseCopySSHIDArgs(args []string) (copySSHIDOptions, error) {
 	var options copySSHIDOptions
