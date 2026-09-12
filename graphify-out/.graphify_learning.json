@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-12T04:52:38.185387+00:00",
+  "generated_at": "2026-09-12T05:17:48.172955+00:00",
   "nodes": {
     "main_loadconfig": {
       "code_fingerprint": "5c26dce95a76ff281777cef33b216bedb3827b0a1433d80470a46518e1d07baa",
@@ -12,7 +12,7 @@
           "q": "PLEASE IMPLEMENT THIS PLAN: 为 pdo 添加跨设备 Copy/Paste"
         }
       ],
-      "score": 0.999688994,
+      "score": 0.999285403,
       "source_file": "main.go",
       "status": "tentative",
       "uses": 1
@@ -28,7 +28,7 @@
           "q": "PLEASE IMPLEMENT THIS PLAN: 为 pdo 添加跨设备 Copy/Paste"
         }
       ],
-      "score": 0.999688994,
+      "score": 0.999285403,
       "source_file": "main.go",
       "status": "tentative",
       "uses": 1
@@ -44,7 +44,7 @@
           "q": "PLEASE IMPLEMENT THIS PLAN: 为 pdo 添加跨设备 Copy/Paste"
         }
       ],
-      "score": 0.999688994,
+      "score": 0.999285403,
       "source_file": "main_test.go",
       "status": "tentative",
       "uses": 1
@@ -60,7 +60,7 @@
           "q": "PLEASE IMPLEMENT THIS PLAN: 为 pdo 添加跨设备 Copy/Paste"
         }
       ],
-      "score": 0.999688994,
+      "score": 0.999285403,
       "source_file": "main.go",
       "status": "tentative",
       "uses": 1
