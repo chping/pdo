@@ -49,15 +49,58 @@ irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
 }
 ```
 
-`cloud_clipboard` 段是可选的，只在调用四个跨设备命令时校验，旧配置无需迁移。`host` 必须是启用 HTTPS 的 Webdis 根地址；用户名和密码用于 HTTP Basic Auth，密码只从 `password_env` 指定的环境变量读取。Webdis 账号只需开放 `MSET`、`MGET`。反向代理及 Webdis 的请求体上限需高于 64 MiB。内容以明文保存在自管 Redis 中，不提供端到端加密。
+### 配置跨设备 Copy & Paste
 
-```sh
-export PDO_CLOUD_CLIPBOARD_PASSWORD="your-password"
-```
+该功能沿用 [cloud-clipboard](https://github.com/yusanshi/cloud-clipboard) 的 Redis + [Webdis](https://github.com/nicolasff/webdis) 架构。pdo 运行时只访问 Webdis HTTP 中转接口，不依赖 cloud-clipboard 的网页或 Python 客户端。pdo 使用 `<prefix>:pdo:...` 专用键，因此可与原客户端共用 Redis，但两者不共享剪贴板或文件记录。
 
-```powershell
-$env:PDO_CLOUD_CLIPBOARD_PASSWORD = "your-password"
-```
+1. 复用已部署 cloud-clipboard 的 Webdis，并为 pdo 配置独立的 HTTP Basic Auth 账号。以下 `webdis.json` 片段适用于仅向 pdo 开放的入口：
+
+   ```json
+   {
+     "http_max_request_size": 134217728,
+     "acl": [
+       {
+         "disabled": ["*"]
+       },
+       {
+         "http_basic_auth": "pdo:your-password",
+         "enabled": ["MSET", "MGET"]
+       }
+     ]
+   }
+   ```
+
+   Webdis 的 ACL 按顺序覆盖，所以通配禁用规则必须放在 pdo 规则之前。如果原 cloud-clipboard 客户端仍在使用，请保留它的账号及 ACL，不要用上述片段整体覆盖现有 `acl`。
+
+2. 通过 HTTPS 反向代理暴露 Webdis 根路径，不要将 Redis 或 Webdis 端口直接公开。Nginx 可在现有 TLS `server` 中使用：
+
+   ```nginx
+   location / {
+       proxy_pass http://127.0.0.1:7379;
+       client_max_body_size 128m;
+       proxy_read_timeout 600s;
+       proxy_send_timeout 600s;
+   }
+   ```
+
+3. 在每台设备的 `~/.config/pdo/config.json` 中填写相同的 `cloud_clipboard` 段：
+
+   - `host`：Webdis 的 HTTPS 根地址，例如 `https://clipboard-api.example.com/`；不是 cloud-clipboard 网页、Redis 地址或子路径，且不能包含凭据、query 或 fragment。
+   - `prefix`：共享空间名；需互通的设备使用同一值，需隔离时使用不同值。
+   - `username`：与 Webdis `http_basic_auth` 中冒号前的用户名一致。
+   - `password_env`：保存密码的环境变量名，不是密码本身。
+
+4. 在每台设备上设置与 Webdis `http_basic_auth` 中冒号后一致的密码：
+
+   ```sh
+   export PDO_CLOUD_CLIPBOARD_PASSWORD="your-password"
+   ```
+
+   ```powershell
+   $env:PDO_CLOUD_CLIPBOARD_PASSWORD = "your-password"
+   ```
+
+`cloud_clipboard` 段是可选的，只在调用四个跨设备命令时校验，旧配置无需迁移。Webdis 及反向代理的请求体上限必须高于 64 MiB。内容以明文保存在自管 Redis 中，不提供端到端加密。修改 Webdis 或反向代理配置后，请重启或重载对应服务。
 
 dotfile 名称使用 kebab-case，并对应命令行的 `--<名称>`。`remote` 使用 GitHub 文件页面的标准链接 `https://github.com/OWNER/REPOSITORY/blob/BRANCH/PATH`；`local` 必须以 `~/` 开头或使用当前平台的绝对路径。pdo 会在内部将文件链接转换为 GitHub Contents API 请求。
 
@@ -84,14 +127,14 @@ pdo upload dotfiles
 pdo download dotfiles --ssh-config
 pdo upload dotfiles --ssh-config --git-config
 
-# 上传参数文本，或上传当前系统剪贴板中的图片/文本
+# 设备 A：上传参数文本，或上传当前系统剪贴板中的图片/文本
 pdo copy "text"
 pdo copy
 
-# 下载最近的文本/图片，写入系统剪贴板并在终端输出
+# 设备 B：下载最近的文本/图片，写入系统剪贴板并在终端输出
 pdo paste
 
-# 上传一个普通文件；下载到当前目录或指定的已存在目录
+# 设备 A 上传文件；设备 B 下载到当前目录或指定的已存在目录
 pdo copy-file ./archive.zip
 pdo paste-file
 pdo paste-file ./downloads

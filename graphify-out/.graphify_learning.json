@@ -1,0 +1,70 @@
+{
+  "generated_at": "2026-09-12T04:52:38.185387+00:00",
+  "nodes": {
+    "main_loadconfig": {
+      "code_fingerprint": "5c26dce95a76ff281777cef33b216bedb3827b0a1433d80470a46518e1d07baa",
+      "label": "loadConfig()",
+      "last": "2026-09-12T04:33:15.006694+00:00",
+      "provenance": [
+        {
+          "date": "2026-09-12T04:33:15.006694+00:00",
+          "outcome": "useful",
+          "q": "PLEASE IMPLEMENT THIS PLAN: 为 pdo 添加跨设备 Copy/Paste"
+        }
+      ],
+      "score": 0.999688994,
+      "source_file": "main.go",
+      "status": "tentative",
+      "uses": 1
+    },
+    "main_run": {
+      "code_fingerprint": "5c26dce95a76ff281777cef33b216bedb3827b0a1433d80470a46518e1d07baa",
+      "label": "run()",
+      "last": "2026-09-12T04:33:15.006694+00:00",
+      "provenance": [
+        {
+          "date": "2026-09-12T04:33:15.006694+00:00",
+          "outcome": "useful",
+          "q": "PLEASE IMPLEMENT THIS PLAN: 为 pdo 添加跨设备 Copy/Paste"
+        }
+      ],
+      "score": 0.999688994,
+      "source_file": "main.go",
+      "status": "tentative",
+      "uses": 1
+    },
+    "main_test_testclient": {
+      "code_fingerprint": "b49c389bc8d707ca620060422c42cb29481f16ff69bea39e9cbd382dba51c4f9",
+      "label": "testClient()",
+      "last": "2026-09-12T04:33:15.006694+00:00",
+      "provenance": [
+        {
+          "date": "2026-09-12T04:33:15.006694+00:00",
+          "outcome": "useful",
+          "q": "PLEASE IMPLEMENT THIS PLAN: 为 pdo 添加跨设备 Copy/Paste"
+        }
+      ],
+      "score": 0.999688994,
+      "source_file": "main_test.go",
+      "status": "tentative",
+      "uses": 1
+    },
+    "pdo_config": {
+      "code_fingerprint": "5c26dce95a76ff281777cef33b216bedb3827b0a1433d80470a46518e1d07baa",
+      "label": "config",
+      "last": "2026-09-12T04:33:15.006694+00:00",
+      "provenance": [
+        {
+          "date": "2026-09-12T04:33:15.006694+00:00",
+          "outcome": "useful",
+          "q": "PLEASE IMPLEMENT THIS PLAN: 为 pdo 添加跨设备 Copy/Paste"
+        }
+      ],
+      "score": 0.999688994,
+      "source_file": "main.go",
+      "status": "tentative",
+      "uses": 1
+    }
+  },
+  "version": 1
+}

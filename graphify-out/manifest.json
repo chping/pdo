@@ -1,0 +1,56 @@
+{
+  "go.mod": {
+    "mtime": 1789174854.9992712,
+    "seen": 1789185935.092631,
+    "ast_hash": "97653e4787ac3eeb41135d768606d01d",
+    "semantic_hash": "97653e4787ac3eeb41135d768606d01d"
+  },
+  "install.ps1": {
+    "mtime": 1789177495.3386502,
+    "seen": 1789185935.092633,
+    "ast_hash": "64b12f35f6aed2a5f276c54c2fd9684a",
+    "semantic_hash": "64b12f35f6aed2a5f276c54c2fd9684a"
+  },
+  "install.sh": {
+    "mtime": 1789177495.3382516,
+    "seen": 1789185935.0926342,
+    "ast_hash": "802b9ca9a2549c0a0666f585178ad526",
+    "semantic_hash": "802b9ca9a2549c0a0666f585178ad526"
+  },
+  "main.go": {
+    "mtime": 1789184941.1314423,
+    "seen": 1789185935.092635,
+    "ast_hash": "cc8642300f7e186852aac580a9af8168",
+    "semantic_hash": "cc8642300f7e186852aac580a9af8168"
+  },
+  "main_test.go": {
+    "mtime": 1789184887.4360802,
+    "seen": 1789185935.0926359,
+    "ast_hash": "8a5f4bafb25c76be7b13e445f3e70a4a",
+    "semantic_hash": "8a5f4bafb25c76be7b13e445f3e70a4a"
+  },
+  "uninstall.ps1": {
+    "mtime": 1789174930.6815674,
+    "seen": 1789185935.0926359,
+    "ast_hash": "e7c48776ce7599730a7371535be7f556",
+    "semantic_hash": "e7c48776ce7599730a7371535be7f556"
+  },
+  "uninstall.sh": {
+    "mtime": 1789174930.675148,
+    "seen": 1789185935.0926368,
+    "ast_hash": "7f6a23d051d54e3b981908963428482c",
+    "semantic_hash": "7f6a23d051d54e3b981908963428482c"
+  },
+  ".github/workflows/ci.yml": {
+    "mtime": 1789179733.0626745,
+    "seen": 1789185935.0926368,
+    "ast_hash": "6becd65b3ab6569e2eeb512da2eda6dd",
+    "semantic_hash": "6becd65b3ab6569e2eeb512da2eda6dd"
+  },
+  "README.md": {
+    "mtime": 1789184758.139038,
+    "seen": 1789185935.092638,
+    "ast_hash": "bc86fbc1c3466ce1ef5b30f5a99f82d4",
+    "semantic_hash": "bc86fbc1c3466ce1ef5b30f5a99f82d4"
+  }
+}
