@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
@@ -27,6 +28,7 @@ const (
 	usage                  = `Usage:
   pdo download dotfiles [--<name> ...]
   pdo upload dotfiles [--<name> ...]
+  pdo copy-ssh-id --identity=<path> [--config=<path>]
   pdo update [--check]
   pdo version`
 )
@@ -39,6 +41,14 @@ var (
 	dotfileNameRegexp    = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 	versionRegexp        = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 	configMigrationSteps = map[int]jsonMigration{}
+	findCommand          = exec.LookPath
+	runCommand           = func(name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+		command := exec.Command(name, args...)
+		command.Stdin = stdin
+		command.Stdout = stdout
+		command.Stderr = stderr
+		return command.Run()
+	}
 )
 
 type config struct {
@@ -121,6 +131,11 @@ type migrationTransaction struct {
 	manifest transactionManifest
 }
 
+type copySSHIDOptions struct {
+	config   string
+	identity string
+}
+
 func main() {
 	args := os.Args[1:]
 	if !(len(args) == 2 && args[0] == "update" && args[1] == "--check") {
@@ -151,6 +166,22 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
 		fmt.Fprintln(stdout, usage)
+		return 0
+	}
+	if len(args) >= 1 && args[0] == "copy-ssh-id" {
+		options, err := parseCopySSHIDArgs(args[1:])
+		if err != nil {
+			fmt.Fprintf(stderr, "pdo: %v\n%s\n", err, usage)
+			return 2
+		}
+		failed, err := copySSHID(options, stdout, stderr)
+		if err != nil {
+			fmt.Fprintf(stderr, "pdo: copy-ssh-id: %v\n", err)
+			return 1
+		}
+		if failed {
+			return 1
+		}
 		return 0
 	}
 	if len(args) >= 1 && args[0] == "update" {
@@ -271,6 +302,345 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func parseCopySSHIDArgs(args []string) (copySSHIDOptions, error) {
+	var options copySSHIDOptions
+	seen := make(map[string]bool)
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		name, value, hasValue := strings.Cut(arg, "=")
+		if name != "--config" && name != "--identity" {
+			return options, fmt.Errorf("invalid copy-ssh-id argument %q", arg)
+		}
+		if seen[name] {
+			return options, fmt.Errorf("duplicate copy-ssh-id argument %s", name)
+		}
+		seen[name] = true
+		if !hasValue {
+			index++
+			if index >= len(args) || strings.HasPrefix(args[index], "--") {
+				return options, fmt.Errorf("%s requires a path", name)
+			}
+			value = args[index]
+		}
+		if value == "" {
+			return options, fmt.Errorf("%s requires a path", name)
+		}
+		if name == "--config" {
+			options.config = value
+		} else {
+			options.identity = value
+		}
+	}
+	if options.identity == "" {
+		return options, fmt.Errorf("--identity is required")
+	}
+	return options, nil
+}
+
+func copySSHID(options copySSHIDOptions, stdout, stderr io.Writer) (bool, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false, fmt.Errorf("find home directory: %w", err)
+	}
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		return false, fmt.Errorf("find working directory: %w", err)
+	}
+	if options.config == "" {
+		options.config = filepath.Join(home, ".ssh", "config")
+	} else {
+		options.config, err = resolveCommandPath(home, workingDirectory, options.config)
+		if err != nil {
+			return false, fmt.Errorf("config path: %w", err)
+		}
+	}
+	options.identity, err = resolveCommandPath(home, workingDirectory, options.identity)
+	if err != nil {
+		return false, fmt.Errorf("identity path: %w", err)
+	}
+	if strings.HasSuffix(options.identity, ".pub") {
+		options.identity = options.identity[:len(options.identity)-4]
+	}
+	files := []struct{ label, path string }{
+		{"config", options.config},
+		{"identity", options.identity},
+		{"public identity key", options.identity + ".pub"},
+	}
+	for _, file := range files {
+		if err := validateReadableFile(file.path); err != nil {
+			return false, fmt.Errorf("%s %s: %w", file.label, file.path, err)
+		}
+	}
+
+	hosts, err := parseSSHHosts(options.config, home)
+	if err != nil {
+		return false, err
+	}
+	if len(hosts) == 0 {
+		return false, fmt.Errorf("no literal Host aliases found in %s", options.config)
+	}
+	ssh, err := findCommand("ssh")
+	if err != nil {
+		return false, fmt.Errorf("ssh was not found in PATH")
+	}
+	sshCopyID, err := findCommand("ssh-copy-id")
+	if err != nil {
+		return false, fmt.Errorf("ssh-copy-id was not found in PATH")
+	}
+	for _, host := range hosts {
+		var commandError bytes.Buffer
+		if err := runCommand(ssh, []string{"-G", "-F", options.config, host}, nil, io.Discard, &commandError); err != nil {
+			message := strings.TrimSpace(commandError.String())
+			if message == "" {
+				message = err.Error()
+			}
+			return false, fmt.Errorf("validate Host %s: %s", host, message)
+		}
+	}
+
+	failed := 0
+	for _, host := range hosts {
+		fmt.Fprintf(stdout, "pdo: %s: running ssh-copy-id\n", host)
+		if err := runCommand(sshCopyID, []string{"-i", options.identity, "-F", options.config, host}, os.Stdin, stdout, stderr); err != nil {
+			fmt.Fprintf(stderr, "pdo: %s: ssh-copy-id failed: %v\n", host, err)
+			failed++
+			continue
+		}
+		fmt.Fprintf(stdout, "pdo: %s: complete\n", host)
+	}
+	fmt.Fprintf(stdout, "pdo: %d succeeded, %d failed\n", len(hosts)-failed, failed)
+	return failed != 0, nil
+}
+
+func resolveCommandPath(home, workingDirectory, value string) (string, error) {
+	if value == "~" {
+		return filepath.Clean(home), nil
+	}
+	if strings.HasPrefix(value, "~/") || (filepath.Separator == '\\' && strings.HasPrefix(value, `~\`)) {
+		return filepath.Clean(filepath.Join(home, filepath.FromSlash(strings.TrimLeft(value[1:], `/\`)))), nil
+	}
+	if strings.HasPrefix(value, "~") {
+		return "", fmt.Errorf("~user paths are not supported")
+	}
+	if !filepath.IsAbs(value) {
+		value = filepath.Join(workingDirectory, value)
+	}
+	return filepath.Clean(value), nil
+}
+
+func validateReadableFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("not a regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return file.Close()
+}
+
+func parseSSHHosts(configPath, home string) ([]string, error) {
+	var hosts []string
+	seenHosts := make(map[string]bool)
+	activeFiles := make(map[string]bool)
+	var parse func(string, int) error
+	parse = func(path string, depth int) error {
+		if depth > 32 {
+			return fmt.Errorf("SSH config Include depth exceeds 32 at %s", path)
+		}
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return fmt.Errorf("resolve SSH config %s: %w", path, err)
+		}
+		info, err := os.Stat(resolved)
+		if err != nil {
+			return fmt.Errorf("inspect SSH config %s: %w", path, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("SSH config %s is not a regular file", path)
+		}
+		if activeFiles[resolved] {
+			return fmt.Errorf("SSH config Include cycle at %s", path)
+		}
+		activeFiles[resolved] = true
+		defer delete(activeFiles, resolved)
+
+		file, err := os.Open(resolved)
+		if err != nil {
+			return fmt.Errorf("read SSH config %s: %w", path, err)
+		}
+		defer file.Close()
+		global := true
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 4096), 1<<20)
+		lineNumber := 0
+		for scanner.Scan() {
+			lineNumber++
+			keyword, values, relevant, err := parseSSHDirective(scanner.Text())
+			if err != nil {
+				return fmt.Errorf("parse SSH config %s:%d: %w", path, lineNumber, err)
+			}
+			if !relevant {
+				continue
+			}
+			switch keyword {
+			case "host":
+				global = false
+				for _, host := range values {
+					if strings.HasPrefix(host, "!") || strings.ContainsAny(host, "*?[") {
+						continue
+					}
+					if strings.HasPrefix(host, "-") {
+						return fmt.Errorf("unsafe Host alias %q", host)
+					}
+					key := strings.ToLower(host)
+					if !seenHosts[key] {
+						seenHosts[key] = true
+						hosts = append(hosts, host)
+					}
+				}
+			case "match":
+				global = false
+			case "include":
+				if !global {
+					continue
+				}
+				for _, pattern := range values {
+					matches, err := resolveInclude(pattern, home)
+					if err != nil {
+						return fmt.Errorf("SSH config %s:%d: %w", path, lineNumber, err)
+					}
+					for _, match := range matches {
+						if err := parse(match, depth+1); err != nil {
+							return err
+						}
+					}
+				}
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return fmt.Errorf("read SSH config %s: %w", path, err)
+		}
+		return nil
+	}
+	if err := parse(configPath, 0); err != nil {
+		return nil, err
+	}
+	return hosts, nil
+}
+
+func parseSSHDirective(line string) (string, []string, bool, error) {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return "", nil, false, nil
+	}
+	end := strings.IndexAny(line, " \t=")
+	if end < 0 {
+		keyword := strings.ToLower(line)
+		if keyword == "host" || keyword == "match" || keyword == "include" {
+			return "", nil, true, fmt.Errorf("%s requires an argument", keyword)
+		}
+		return "", nil, false, nil
+	}
+	keyword := strings.ToLower(line[:end])
+	if keyword != "host" && keyword != "match" && keyword != "include" {
+		return "", nil, false, nil
+	}
+	rest := strings.TrimSpace(line[end:])
+	if strings.HasPrefix(rest, "=") {
+		rest = strings.TrimSpace(rest[1:])
+	}
+	values, err := splitSSHArguments(rest)
+	if err != nil {
+		return "", nil, true, err
+	}
+	if len(values) == 0 {
+		return "", nil, true, fmt.Errorf("%s requires an argument", keyword)
+	}
+	return keyword, values, true, nil
+}
+
+func splitSSHArguments(value string) ([]string, error) {
+	var values []string
+	var current strings.Builder
+	quote := byte(0)
+	escaped := false
+	flush := func() {
+		if current.Len() != 0 {
+			values = append(values, current.String())
+			current.Reset()
+		}
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if escaped {
+			current.WriteByte(character)
+			escaped = false
+			continue
+		}
+		if character == '\\' {
+			if index+1 < len(value) && strings.ContainsRune(" \t#'\"\\", rune(value[index+1])) {
+				escaped = true
+			} else {
+				current.WriteByte(character)
+			}
+			continue
+		}
+		if quote != 0 {
+			if character == quote {
+				quote = 0
+			} else {
+				current.WriteByte(character)
+			}
+			continue
+		}
+		if character == '\'' || character == '"' {
+			quote = character
+			continue
+		}
+		if character == '#' {
+			break
+		}
+		if character == ' ' || character == '\t' {
+			flush()
+			continue
+		}
+		current.WriteByte(character)
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unterminated quote or escape")
+	}
+	flush()
+	return values, nil
+}
+
+func resolveInclude(pattern, home string) ([]string, error) {
+	if strings.ContainsAny(pattern, "$%") {
+		return nil, fmt.Errorf("Include environment variables and tokens are not supported: %s", pattern)
+	}
+	resolved, err := resolveCommandPath(home, filepath.Join(home, ".ssh"), pattern)
+	if err != nil {
+		return nil, err
+	}
+	hasGlob := strings.ContainsAny(pattern, "*?[")
+	if !hasGlob {
+		if _, err := os.Stat(resolved); err != nil {
+			return nil, fmt.Errorf("Include file %s: %w", resolved, err)
+		}
+		return []string{resolved}, nil
+	}
+	matches, err := filepath.Glob(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Include glob %s: %w", pattern, err)
+	}
+	sort.Strings(matches)
+	return matches, nil
 }
 
 func loadConfig(path string) (config, error) {

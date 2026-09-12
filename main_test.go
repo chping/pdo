@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -141,6 +142,240 @@ func TestRunUsageSelectorsAndExitCodes(t *testing.T) {
 	stderr.Reset()
 	if code := run([]string{"download", "dotfiles", "--ssh-config", "--ssh-config"}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "1 succeeded, 0 failed") {
 		t.Fatalf("duplicate: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestCopySSHIDArgumentParsing(t *testing.T) {
+	tests := []struct {
+		args     []string
+		config   string
+		identity string
+		wantErr  bool
+	}{
+		{args: []string{"--identity=key"}, identity: "key"},
+		{args: []string{"--config", "config", "--identity", "key"}, config: "config", identity: "key"},
+		{args: []string{"--identity", "key", "--config=config"}, config: "config", identity: "key"},
+		{args: nil, wantErr: true},
+		{args: []string{"--identity"}, wantErr: true},
+		{args: []string{"--identity="}, wantErr: true},
+		{args: []string{"--identity", "--config=config"}, wantErr: true},
+		{args: []string{"--identity=one", "--identity", "two"}, wantErr: true},
+		{args: []string{"--unknown=value"}, wantErr: true},
+		{args: []string{"key"}, wantErr: true},
+	}
+	for _, test := range tests {
+		options, err := parseCopySSHIDArgs(test.args)
+		if test.wantErr {
+			if err == nil {
+				t.Errorf("args=%v succeeded", test.args)
+			}
+			continue
+		}
+		if err != nil || options.config != test.config || options.identity != test.identity {
+			t.Errorf("args=%v options=%+v error=%v", test.args, options, err)
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"copy-ssh-id", "--identity"}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "requires a path") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestResolveCommandPath(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	working := filepath.Join(root, "work")
+	absolute := filepath.Join(root, "absolute", "key")
+	tests := []struct {
+		value string
+		want  string
+	}{
+		{value: "~/key", want: filepath.Join(home, "key")},
+		{value: "relative/key", want: filepath.Join(working, "relative", "key")},
+		{value: absolute, want: absolute},
+	}
+	for _, test := range tests {
+		got, err := resolveCommandPath(home, working, test.value)
+		if err != nil || got != test.want {
+			t.Errorf("value=%q got=%q want=%q error=%v", test.value, got, test.want, err)
+		}
+	}
+	if _, err := resolveCommandPath(home, working, "~other/key"); err == nil {
+		t.Fatal("~user path accepted")
+	}
+}
+
+func TestParseSSHHostsIncludesAndPatterns(t *testing.T) {
+	home := t.TempDir()
+	sshDir := filepath.Join(home, ".ssh")
+	includeDir := filepath.Join(sshDir, "config.d")
+	if err := os.MkdirAll(includeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(sshDir, "nested.conf"), "Host Nested\n")
+	writeTestFile(t, filepath.Join(includeDir, "a.conf"), "Include nested.conf\nHost Alpha Shared\n")
+	writeTestFile(t, filepath.Join(includeDir, "b.conf"), "Host shared Bravo\n")
+	config := filepath.Join(sshDir, "config")
+	writeTestFile(t, config, `Include "config.d/*.conf"
+Include missing-*.conf
+Host Root root *.example !skip
+Host = Beta
+Match all
+  Include ignored.conf
+Host Last
+`)
+	hosts, err := parseSSHHosts(config, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"Nested", "Alpha", "Shared", "Bravo", "Root", "Beta", "Last"}
+	if strings.Join(hosts, ",") != strings.Join(want, ",") {
+		t.Fatalf("hosts=%v want=%v", hosts, want)
+	}
+}
+
+func TestParseSSHHostsRejectsInvalidConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  string
+		extra   map[string]string
+		wantErr string
+	}{
+		{name: "missing literal include", config: "Include missing.conf\nHost ok\n", wantErr: "Include file"},
+		{name: "environment include", config: "Include ${HOME}/config\nHost ok\n", wantErr: "not supported"},
+		{name: "unsafe host", config: "Host -danger\n", wantErr: "unsafe Host"},
+		{name: "empty host", config: "Host\n", wantErr: "requires an argument"},
+		{name: "unterminated quote", config: "Host \"broken\n", wantErr: "unterminated"},
+		{name: "cycle", config: "Include loop.conf\n", extra: map[string]string{"loop.conf": "Include config\n"}, wantErr: "cycle"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			home := t.TempDir()
+			sshDir := filepath.Join(home, ".ssh")
+			if err := os.MkdirAll(sshDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			config := filepath.Join(sshDir, "config")
+			writeTestFile(t, config, test.config)
+			for name, content := range test.extra {
+				writeTestFile(t, filepath.Join(sshDir, name), content)
+			}
+			if _, err := parseSSHHosts(config, home); err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("error=%v want=%q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestRunCopySSHIDPreflightsThenContinues(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(sshDir, "config"), "Host Alpha Beta\n")
+	writeTestFile(t, filepath.Join(sshDir, "id_test"), "private")
+	writeTestFile(t, filepath.Join(sshDir, "id_test.pub"), "public")
+
+	previousFind, previousRun := findCommand, runCommand
+	t.Cleanup(func() { findCommand, runCommand = previousFind, previousRun })
+	findCommand = func(name string) (string, error) { return "/mock/" + name, nil }
+	type call struct {
+		name string
+		args []string
+	}
+	var calls []call
+	runCommand = func(name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+		calls = append(calls, call{name: name, args: append([]string(nil), args...)})
+		if strings.HasSuffix(name, "ssh-copy-id") {
+			fmt.Fprintf(stdout, "tool: %s\n", args[len(args)-1])
+			if args[len(args)-1] == "Beta" {
+				return errors.New("exit status 1")
+			}
+			if stdin != os.Stdin {
+				t.Fatal("ssh-copy-id did not inherit stdin")
+			}
+		}
+		return nil
+	}
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"copy-ssh-id", "--identity", "~/.ssh/id_test.pub"}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stdout.String(), "1 succeeded, 1 failed") || !strings.Contains(stderr.String(), "Beta: ssh-copy-id failed") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if len(calls) != 4 || calls[0].name != "/mock/ssh" || calls[1].name != "/mock/ssh" || calls[2].name != "/mock/ssh-copy-id" || calls[3].name != "/mock/ssh-copy-id" {
+		t.Fatalf("calls=%+v", calls)
+	}
+	identity := filepath.Join(sshDir, "id_test")
+	config := filepath.Join(sshDir, "config")
+	if strings.Join(calls[2].args, "|") != strings.Join([]string{"-i", identity, "-F", config, "Alpha"}, "|") {
+		t.Fatalf("copy args=%v", calls[2].args)
+	}
+}
+
+func TestRunCopySSHIDPreflightFailurePreventsCopies(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(sshDir, "config"), "Host Alpha Beta\n")
+	writeTestFile(t, filepath.Join(sshDir, "id"), "private")
+	writeTestFile(t, filepath.Join(sshDir, "id.pub"), "public")
+
+	previousFind, previousRun := findCommand, runCommand
+	t.Cleanup(func() { findCommand, runCommand = previousFind, previousRun })
+	findCommand = func(name string) (string, error) { return name, nil }
+	copyCalls := 0
+	runCommand = func(name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+		if name == "ssh-copy-id" {
+			copyCalls++
+		}
+		if name == "ssh" && args[len(args)-1] == "Beta" {
+			fmt.Fprint(stderr, "bad config")
+			return errors.New("exit status 255")
+		}
+		return nil
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"copy-ssh-id", "--identity=~/.ssh/id"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "validate Host Beta") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if copyCalls != 0 {
+		t.Fatalf("copy calls=%d", copyCalls)
+	}
+}
+
+func TestCopySSHIDRequiresToolsAndLiteralHosts(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(sshDir, "config")
+	writeTestFile(t, config, "Host Alpha\n")
+	writeTestFile(t, filepath.Join(sshDir, "id"), "private")
+	writeTestFile(t, filepath.Join(sshDir, "id.pub"), "public")
+
+	previousFind := findCommand
+	t.Cleanup(func() { findCommand = previousFind })
+	findCommand = func(name string) (string, error) {
+		if name == "ssh-copy-id" {
+			return "", errors.New("missing")
+		}
+		return name, nil
+	}
+	if _, err := copySSHID(copySSHIDOptions{identity: filepath.Join(sshDir, "id")}, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "ssh-copy-id was not found") {
+		t.Fatalf("tool error=%v", err)
+	}
+
+	writeTestFile(t, config, "Host *.example !blocked\n")
+	if _, err := copySSHID(copySSHIDOptions{identity: filepath.Join(sshDir, "id")}, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "no literal Host") {
+		t.Fatalf("empty hosts error=%v", err)
 	}
 }
 
@@ -917,6 +1152,13 @@ func writeConfig(t *testing.T, home string, dotfiles map[string]dotfileConfig) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(configDir, "config.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeTestFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }

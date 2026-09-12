@@ -1,6 +1,6 @@
 # pdo
 
-跨平台个人命令行工具集。v0.1.0 支持在本地与 GitHub 私有仓库之间同步 dotfiles。
+跨平台个人命令行工具集。v0.1.1 支持同步 dotfiles，以及向 SSH config 中的主机批量部署公钥。
 
 ## 安装
 
@@ -68,6 +68,12 @@ pdo upload dotfiles
 pdo download dotfiles --ssh-config
 pdo upload dotfiles --ssh-config --git-config
 
+# 使用默认 ~/.ssh/config 部署指定公钥
+pdo copy-ssh-id --identity ~/.ssh/id_ed25519
+
+# 使用指定 SSH config；也支持 --identity=<path> 和 --config=<path>
+pdo copy-ssh-id --identity ~/.ssh/id_ed25519.pub --config ./ssh_config
+
 pdo version
 pdo --version
 pdo update --check
@@ -84,13 +90,23 @@ pdo --help
 
 仅同步普通文件的原始字节；不支持目录、glob、删除、合并或跨文件事务。
 
+### 部署 SSH 公钥
+
+`copy-ssh-id` 要求 `--identity`，`--config` 默认使用 `~/.ssh/config`。路径可以是绝对路径、`~/...` 或相对当前目录；identity 可以指向私钥基路径或 `.pub` 文件。pdo 会在开始连接前确认 config、私钥及对应公钥均为可读普通文件。
+
+pdo 按配置顺序处理字面 `Host` 别名，忽略通配符和否定模式并去重。根配置以及每个 Include 文件全局区域中的 `Include` 会递归展开；支持 `~/`、相对 `~/.ssh` 的路径和 glob，但不支持 Include 中的环境变量或 OpenSSH token。条件块中的 Include 不用于枚举 Host。
+
+开始复制前，pdo 会通过 `ssh -G` 验证所有 Host 的 OpenSSH 配置；验证全部通过后依次执行 `ssh-copy-id -i <identity> -F <config> <host>`。`ssh-copy-id` 自行判断公钥是否已经安装，其密码、私钥口令和 host-key 确认直接使用当前终端。某个 Host 失败不会阻止后续 Host，最终有任一失败时退出 `1`。
+
+所有平台都要求 `ssh` 和 `ssh-copy-id` 可从 `PATH` 找到。Windows OpenSSH 通常不附带 `ssh-copy-id`，需要用户自行安装兼容实现；缺少工具时该命令会在连接前失败，其他 pdo 命令不受影响。
+
 ## 更新
 
 `pdo update --check` 只检查 GitHub 上的最新稳定 Release，不写入本地文件。`pdo update` 会校验同一 Release 中的 `SHA256SUMS`、验证候选二进制版本，然后替换当前实际执行文件。
 
 更新时会先锁定 `~/.config/pdo/.update-transaction`，备份需要迁移的 pdo 配置或数据以及旧二进制。迁移或切换失败会恢复已修改内容；恢复失败时会保留事务目录并输出路径。成功后会删除配置和数据备份。pdo 不扫描目录、不执行远程迁移脚本，也不会修改配置中列出的 dotfiles。
 
-普通 `go build` 生成的开发版本显示为 `pdo devel`，并拒绝执行更新。旧版 v0.1.0 尚无自更新能力，需要最后一次运行上面的安装脚本；安装新基线后，后续版本可使用 `pdo update`。
+普通 `go build` 生成的开发版本显示为 `pdo devel`，并拒绝执行更新。v0.1.0 是首个自更新基线，可使用 `pdo update` 升级到后续稳定版本。
 
 ## 卸载
 
@@ -117,4 +133,4 @@ go test ./...
 go build .
 ```
 
-推送 `v*` tag 会注入 tag 作为版本号，并在测试通过后发布 macOS、Linux、Windows 的 `amd64` / `arm64` 二进制、安装与卸载脚本及 `SHA256SUMS`。重写后的 `v0.1.0` 是首个固定的自更新基线，后续发布必须使用新版本号。
+推送 `v*` tag 会注入 tag 作为版本号，并在测试通过后发布 macOS、Linux、Windows 的 `amd64` / `arm64` 二进制、安装与卸载脚本及 `SHA256SUMS`。v0.1.0 及后续 Release tag 均不可移动或替换资产。
