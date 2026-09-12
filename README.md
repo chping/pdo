@@ -126,8 +126,9 @@ pdo upload dotfiles
 pdo download dotfiles --ssh-config
 pdo upload dotfiles --ssh-config --git-config
 
-# 设备 A：上传参数文本，或上传当前系统剪贴板中的图片/文本
+# 设备 A：上传参数文本、管道文本，或当前系统剪贴板中的图片/文本
 pdo copy "text"
+printf 'text from pipe\n' | pdo copy
 pdo copy
 
 # 设备 B：下载最近的文本/图片；系统剪贴板不可用时仍在终端输出
@@ -159,6 +160,8 @@ pdo --help
 
 macOS 使用系统 AppKit 剪贴板，Windows 使用 PowerShell/.NET。Linux Wayland 需要 `wl-clipboard`（`sudo apt install wl-clipboard`、`sudo dnf install wl-clipboard` 或 `sudo pacman -S wl-clipboard`），X11 需要 `xclip`（`sudo apt install xclip`、`sudo dnf install xclip` 或 `sudo pacman -S xclip`）。没有 Wayland/X11 图形会话或剪贴板写入失败时，`pdo paste` 会提示原因并仍将文本或图片摘要输出到终端；剪贴板同时含图片和文本时优先使用图片。
 
+`pdo copy` 带文本参数时优先使用参数；无参数且标准输入来自管道或文件重定向时，将输入原样作为 UTF-8 文本上传；交互终端中无参数时读取系统剪贴板。
+
 批量同步按配置名称排序执行；指定多个选择器时按参数顺序执行。某项失败不会阻止后续项目，最终只要有一项失败，命令就返回退出码 `1`。
 
 `download` 在内容变化时先在实际目标旁创建 `<文件名>.pdo-backup-<UTC时间戳>`，再替换文件。Unix 上保留已有文件权限，新文件为 `0600`。符号链接会被保留并更新最终目标；悬空、循环链接及非普通文件会被拒绝。
@@ -178,6 +181,8 @@ pdo 按配置顺序处理字面 `Host` 别名，忽略通配符和否定模式�
 所有平台都要求 `ssh` 可从 `PATH` 找到；macOS 和 Linux 还需要 `ssh-copy-id`。Windows 只需启用系统的 OpenSSH Client。
 
 ## 更新
+
+pdo 每 24 小时在命令启动时检查一次最新稳定 Release，并使用 `~/.config/pdo/.update-check` 记录检查时间。发现新版本时，交互终端可以输入 `y` 或 `yes` 立即升级，也可以直接回车忽略并继续执行当前命令；管道或重定向场景只提示运行 `pdo update`，不会读取标准输入。升级完成后请重新执行原命令。
 
 `pdo update --check` 只检查 GitHub 上的最新稳定 Release，不写入本地文件。`pdo update` 会校验同一 Release 中的 `SHA256SUMS`、验证候选二进制版本，然后替换当前实际执行文件。
 

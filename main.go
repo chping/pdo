@@ -34,6 +34,8 @@ const (
 	maxCloudTextResponse    = 6*maxClipboardPayload + maxCloudControlResponse
 	cloudUploadChunkSize    = 1 << 20
 	maxSetupInputLength     = 8192
+	automaticUpdateInterval = 24 * time.Hour
+	automaticUpdateTimeout  = 3 * time.Second
 	pdoEnvFileName          = ".env"
 	legacyPDOEnvFileName    = "env.json"
 	githubPATEnvName        = "PDO_GITHUB_PAT"
@@ -227,6 +229,9 @@ func main() {
 			}
 		}
 	}
+	if automaticUpdate(args, os.Stdin, isSetupTerminal(os.Stdin), os.Stdout, os.Stderr, updater.install) {
+		os.Exit(0)
+	}
 	os.Exit(run(args, os.Stdout, os.Stderr))
 }
 
@@ -268,7 +273,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, usage)
 			return 2
 		}
-		if err := runCloudClipboard(args, stdout, stderr); err != nil {
+		if err := runCloudClipboard(args, os.Stdin, stdout, stderr); err != nil {
 			fmt.Fprintf(stderr, "pdo: %s: %v\n", args[0], err)
 			return 1
 		}
@@ -299,25 +304,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "pdo: development builds cannot update")
 			return 1
 		}
-		home, err := os.UserHomeDir()
+		u, err := newUpdater(30 * time.Second)
 		if err != nil {
-			fmt.Fprintf(stderr, "pdo: find home directory: %v\n", err)
+			fmt.Fprintf(stderr, "pdo: %v\n", err)
 			return 1
-		}
-		executable, err := os.Executable()
-		if err != nil {
-			fmt.Fprintf(stderr, "pdo: find executable: %v\n", err)
-			return 1
-		}
-		u := updater{
-			http:         &http.Client{Timeout: 30 * time.Second},
-			apiBase:      releaseAPIBase,
-			downloadBase: releaseDownloadBase,
-			version:      version,
-			goos:         runtime.GOOS,
-			goarch:       runtime.GOARCH,
-			executable:   executable,
-			home:         home,
 		}
 		if err := u.run(len(args) == 2, stdout); err != nil {
 			fmt.Fprintf(stderr, "pdo: update: %v\n", err)
@@ -414,7 +404,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func runCloudClipboard(args []string, stdout, stderr io.Writer) error {
+func runCloudClipboard(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("find home directory: %w", err)
@@ -438,9 +428,24 @@ func runCloudClipboard(args []string, stdout, stderr io.Writer) error {
 		if len(args) == 2 {
 			data = []byte(args[1])
 		} else {
-			kind, data, err = readClipboard()
-			if err != nil {
-				return err
+			readStandardInput := true
+			if file, ok := stdin.(*os.File); ok {
+				info, statErr := file.Stat()
+				if statErr != nil {
+					return fmt.Errorf("inspect standard input: %w", statErr)
+				}
+				readStandardInput = info.Mode()&os.ModeCharDevice == 0
+			}
+			if readStandardInput {
+				data, err = io.ReadAll(io.LimitReader(stdin, maxClipboardPayload+1))
+				if err != nil {
+					return fmt.Errorf("read standard input: %w", err)
+				}
+			} else {
+				kind, data, err = readClipboard()
+				if err != nil {
+					return err
+				}
 			}
 		}
 		if _, _, err := validateClipboardPayload(kind, data); err != nil {
@@ -2398,6 +2403,69 @@ func compareVersions(left, right semanticVersion) int {
 		}
 	}
 	return 0
+}
+
+func newUpdater(timeout time.Duration) (updater, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return updater{}, fmt.Errorf("find home directory: %w", err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return updater{}, fmt.Errorf("find executable: %w", err)
+	}
+	return updater{
+		http:         &http.Client{Timeout: timeout},
+		apiBase:      releaseAPIBase,
+		downloadBase: releaseDownloadBase,
+		version:      version,
+		goos:         runtime.GOOS,
+		goarch:       runtime.GOARCH,
+		executable:   executable,
+		home:         home,
+	}, nil
+}
+
+func automaticUpdate(args []string, stdin io.Reader, interactive bool, stdout, stderr io.Writer, install func(updater, release, io.Writer) error) bool {
+	if version == "devel" || (len(args) > 0 && (args[0] == "update" || args[0] == "__pdo-migrate")) {
+		return false
+	}
+	u, err := newUpdater(automaticUpdateTimeout)
+	if err != nil {
+		return false
+	}
+	marker := filepath.Join(u.home, ".config", "pdo", ".update-check")
+	if info, err := os.Stat(marker); err == nil {
+		if time.Since(info.ModTime()) < automaticUpdateInterval {
+			return false
+		}
+	} else if !os.IsNotExist(err) {
+		return false
+	}
+
+	found, latest, checkErr := u.latestRelease()
+	_ = atomicWriteFile(marker, nil, 0o600)
+	current, err := parseVersion(u.version)
+	if checkErr != nil || err != nil || compareVersions(current, latest) >= 0 {
+		return false
+	}
+	if !interactive {
+		fmt.Fprintf(stderr, "pdo: update available: %s -> %s; run 'pdo update' to upgrade\n", u.version, found.TagName)
+		return false
+	}
+
+	fmt.Fprintf(stderr, "pdo: update available: %s -> %s. Upgrade now? [y/N] ", u.version, found.TagName)
+	answer, _ := bufio.NewReader(stdin).ReadString('\n')
+	answer = strings.TrimSpace(answer)
+	if !strings.EqualFold(answer, "y") && !strings.EqualFold(answer, "yes") {
+		return false
+	}
+	if err := install(u, found, stdout); err != nil {
+		fmt.Fprintf(stderr, "pdo: automatic update failed: %v\n", err)
+		return false
+	}
+	fmt.Fprintln(stderr, "pdo: update installed; rerun the command")
+	return true
 }
 
 func (u updater) run(check bool, stdout io.Writer) error {

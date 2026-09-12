@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestConfigValidation(t *testing.T) {
@@ -408,6 +409,29 @@ func TestCloudClipboardTextAndImageCommands(t *testing.T) {
 	}
 	if code := run([]string{"paste"}, &stdout, &stderr); code != 0 || stdout.String() != text || writtenKind != "text" || string(writtenData) != text {
 		t.Fatalf("paste code=%d stdout=%q stderr=%q kind=%q data=%q", code, stdout.String(), stderr.String(), writtenKind, writtenData)
+	}
+	pipeReader, pipeWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pipeWriter.WriteString("piped text\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pipeWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := runCloudClipboard([]string{"copy"}, pipeReader, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if err := pipeReader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	if code := run([]string{"paste"}, &stdout, &stderr); code != 0 || stdout.String() != "piped text\n" || writtenKind != "text" || string(writtenData) != "piped text\n" {
+		t.Fatalf("piped paste code=%d stdout=%q stderr=%q kind=%q data=%q", code, stdout.String(), stderr.String(), writtenKind, writtenData)
+	}
+	if code := run([]string{"copy", text}, &stdout, &stderr); code != 0 {
+		t.Fatalf("restore text copy code=%d stderr=%q", code, stderr.String())
 	}
 	previousTerminal := isTerminal
 	isTerminal = func(io.Writer) bool { return true }
@@ -1327,6 +1351,112 @@ func TestUpdateCheckIsReadOnly(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAutomaticUpdate(t *testing.T) {
+	previousVersion, previousAPIBase := version, releaseAPIBase
+	version = "v0.1.0"
+	t.Cleanup(func() { version, releaseAPIBase = previousVersion, previousAPIBase })
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		json.NewEncoder(w).Encode(release{TagName: "v0.1.1"})
+	}))
+	defer server.Close()
+	releaseAPIBase = server.URL
+
+	for _, answer := range []string{"Y", "y", "yes", "YES"} {
+		t.Run("accept "+answer, func(t *testing.T) {
+			setHome(t, t.TempDir())
+			installed := false
+			var stderr bytes.Buffer
+			if !automaticUpdate([]string{"version"}, strings.NewReader(answer+"\n"), true, io.Discard, &stderr, func(updater, release, io.Writer) error {
+				installed = true
+				return nil
+			}) || !installed || !strings.Contains(stderr.String(), "rerun the command") {
+				t.Fatalf("answer=%q installed=%v stderr=%q", answer, installed, stderr.String())
+			}
+		})
+	}
+
+	t.Run("noninteractive preserves stdin and caches check", func(t *testing.T) {
+		home := t.TempDir()
+		setHome(t, home)
+		input := strings.NewReader("piped text\n")
+		var stderr bytes.Buffer
+		before := requests
+		if automaticUpdate([]string{"copy"}, input, false, io.Discard, &stderr, func(updater, release, io.Writer) error {
+			t.Fatal("installed without confirmation")
+			return nil
+		}) {
+			t.Fatal("noninteractive check stopped command")
+		}
+		remaining, _ := io.ReadAll(input)
+		if string(remaining) != "piped text\n" || !strings.Contains(stderr.String(), "run 'pdo update'") {
+			t.Fatalf("remaining=%q stderr=%q", remaining, stderr.String())
+		}
+		if automaticUpdate([]string{"copy"}, strings.NewReader("yes\n"), true, io.Discard, io.Discard, func(updater, release, io.Writer) error {
+			t.Fatal("fresh cache installed update")
+			return nil
+		}) || requests != before+1 {
+			t.Fatalf("fresh cache made another request: before=%d after=%d", before, requests)
+		}
+		marker := filepath.Join(home, ".config", "pdo", ".update-check")
+		stale := time.Now().Add(-automaticUpdateInterval - time.Minute)
+		if err := os.Chtimes(marker, stale, stale); err != nil {
+			t.Fatal(err)
+		}
+		if automaticUpdate([]string{"copy"}, strings.NewReader("n\n"), true, io.Discard, io.Discard, func(updater, release, io.Writer) error {
+			t.Fatal("installed after rejection")
+			return nil
+		}) || requests != before+2 {
+			t.Fatalf("stale cache requests: before=%d after=%d", before, requests)
+		}
+	})
+
+	t.Run("skips update internal and development commands", func(t *testing.T) {
+		setHome(t, t.TempDir())
+		before := requests
+		for _, args := range [][]string{{"update"}, {"__pdo-migrate"}} {
+			if automaticUpdate(args, strings.NewReader("yes\n"), true, io.Discard, io.Discard, func(updater, release, io.Writer) error { return nil }) {
+				t.Fatalf("args=%v stopped command", args)
+			}
+		}
+		version = "devel"
+		if automaticUpdate([]string{"version"}, strings.NewReader("yes\n"), true, io.Discard, io.Discard, func(updater, release, io.Writer) error { return nil }) {
+			t.Fatal("development build stopped command")
+		}
+		version = "v0.1.0"
+		if requests != before {
+			t.Fatalf("skipped commands made %d requests", requests-before)
+		}
+	})
+
+	t.Run("check and install failures do not stop command", func(t *testing.T) {
+		home := t.TempDir()
+		setHome(t, home)
+		previous := releaseAPIBase
+		releaseAPIBase = "http://127.0.0.1:1"
+		if automaticUpdate([]string{"version"}, strings.NewReader("yes\n"), true, io.Discard, io.Discard, func(updater, release, io.Writer) error { return nil }) {
+			t.Fatal("failed check stopped command")
+		}
+		if _, err := os.Stat(filepath.Join(home, ".config", "pdo", ".update-check")); err != nil {
+			t.Fatalf("failed check was not cached: %v", err)
+		}
+		releaseAPIBase = previous
+		stale := time.Now().Add(-automaticUpdateInterval - time.Minute)
+		marker := filepath.Join(home, ".config", "pdo", ".update-check")
+		if err := os.Chtimes(marker, stale, stale); err != nil {
+			t.Fatal(err)
+		}
+		var stderr bytes.Buffer
+		if automaticUpdate([]string{"version"}, strings.NewReader("yes\n"), true, io.Discard, &stderr, func(updater, release, io.Writer) error {
+			return errors.New("injected failure")
+		}) || !strings.Contains(stderr.String(), "injected failure") {
+			t.Fatalf("install failure stderr=%q", stderr.String())
+		}
+	})
 }
 
 func TestUpdateRejectsBadLatestRelease(t *testing.T) {
