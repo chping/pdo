@@ -63,6 +63,7 @@ var (
 	versionRegexp        = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 	uuidRegexp           = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 	configMigrationSteps = map[int]jsonMigration{}
+	copySSHIDGOOS        = runtime.GOOS
 	findCommand          = exec.LookPath
 	runCommand           = func(name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		command := exec.Command(name, args...)
@@ -1250,6 +1251,8 @@ if ($args[1] -eq 'image-png') {
     [Windows.Forms.Clipboard]::SetDataObject($text, $true)
 }`
 
+const windowsSSHCopyIDCommand = `umask 077; mkdir -p "$HOME/.ssh" && touch "$HOME/.ssh/authorized_keys" && chmod 700 "$HOME/.ssh" && chmod 600 "$HOME/.ssh/authorized_keys" && IFS= read -r key && key_data=$(printf '%s\n' "$key" | awk '{print $2}') && [ -n "$key_data" ] && { awk -v key="$key_data" '{ for (i = 1; i <= NF; i++) if ($i == key) found = 1 } END { exit !found }' "$HOME/.ssh/authorized_keys" || printf '%s\n' "$key" >> "$HOME/.ssh/authorized_keys"; }`
+
 func parseCopySSHIDArgs(args []string) (copySSHIDOptions, error) {
 	var options copySSHIDOptions
 	seen := make(map[string]bool)
@@ -1331,9 +1334,23 @@ func copySSHID(options copySSHIDOptions, stdout, stderr io.Writer) (bool, error)
 	if err != nil {
 		return false, fmt.Errorf("ssh was not found in PATH")
 	}
-	sshCopyID, err := findCommand("ssh-copy-id")
-	if err != nil {
-		return false, fmt.Errorf("ssh-copy-id was not found in PATH")
+	sshCopyID := ""
+	var publicKey []byte
+	if copySSHIDGOOS == "windows" {
+		publicKey, err = os.ReadFile(options.identity + ".pub")
+		if err != nil {
+			return false, fmt.Errorf("read public identity key: %w", err)
+		}
+		publicKey = bytes.TrimSpace(publicKey)
+		if len(publicKey) == 0 {
+			return false, fmt.Errorf("public identity key is empty")
+		}
+		publicKey = append(publicKey, '\n')
+	} else {
+		sshCopyID, err = findCommand("ssh-copy-id")
+		if err != nil {
+			return false, fmt.Errorf("ssh-copy-id was not found in PATH")
+		}
 	}
 	for _, host := range hosts {
 		var commandError bytes.Buffer
@@ -1348,9 +1365,19 @@ func copySSHID(options copySSHIDOptions, stdout, stderr io.Writer) (bool, error)
 
 	failed := 0
 	for _, host := range hosts {
-		fmt.Fprintf(stdout, "pdo: %s: running ssh-copy-id\n", host)
-		if err := runCommand(sshCopyID, []string{"-i", options.identity, "-F", options.config, host}, os.Stdin, stdout, stderr); err != nil {
-			fmt.Fprintf(stderr, "pdo: %s: ssh-copy-id failed: %v\n", host, err)
+		command := sshCopyID
+		arguments := []string{"-i", options.identity, "-F", options.config, host}
+		var stdin io.Reader = os.Stdin
+		label := "ssh-copy-id"
+		if copySSHIDGOOS == "windows" {
+			command = ssh
+			arguments = []string{"-F", options.config, host, windowsSSHCopyIDCommand}
+			stdin = bytes.NewReader(publicKey)
+			label = "ssh"
+		}
+		fmt.Fprintf(stdout, "pdo: %s: running %s\n", host, label)
+		if err := runCommand(command, arguments, stdin, stdout, stderr); err != nil {
+			fmt.Fprintf(stderr, "pdo: %s: %s failed: %v\n", host, label, err)
 			failed++
 			continue
 		}

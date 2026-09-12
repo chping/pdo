@@ -27,8 +27,6 @@ irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
 
 推荐在终端运行 `pdo setup`。它会隐藏输入 GitHub PAT 和剪贴板密码，引导填写 SSH config 的 GitHub 文件链接及可选剪贴板服务，并将凭据写入 `~/.config/pdo/.env`（Unix 上权限为 `0600`）。该文件使用普通 `KEY=value` 格式，`pdo` 会自动加载；不会修改启动它的 shell 配置，且当前 shell 中已设置的同名环境变量优先。
 
-旧版 `env.json` 在 `.env` 不存在时仍会被读取；下次运行 `pdo setup` 会写入新的 `.env`。
-
 也可以手工编辑配置：
 
 ```json
@@ -98,7 +96,7 @@ irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
 
 `cloud_clipboard` 段是可选的，只在调用四个跨设备命令时校验。反向代理必须允许至少 64 MiB 请求体，读写超时应不少于 600 秒。
 
-从 v0.1.2 升级到 v0.1.3 时必须手工把原来的 `prefix`、`username` 改为 `room`，并把 `host` 改为 cloud-clipboard-go 服务基址；Webdis 中已有的暂存内容不会迁移。内容由自管的 cloud-clipboard-go 保存，不提供端到端加密。
+内容由自管的 cloud-clipboard-go 保存，不提供端到端加密。
 
 dotfile 名称使用 kebab-case，并对应命令行的 `--<名称>`。`remote` 使用 GitHub 文件页面的标准链接 `https://github.com/OWNER/REPOSITORY/blob/BRANCH/PATH`；`local` 必须以 `~/` 开头或使用当前平台的绝对路径。pdo 会在内部将文件链接转换为 GitHub Contents API 请求。
 
@@ -172,17 +170,15 @@ macOS 使用系统 AppKit 剪贴板，Windows 使用 PowerShell/.NET。Linux Way
 
 pdo 按配置顺序处理字面 `Host` 别名，忽略通配符和否定模式并去重。根配置以及每个 Include 文件全局区域中的 `Include` 会递归展开；支持 `~/`、相对 `~/.ssh` 的路径和 glob，但不支持 Include 中的环境变量或 OpenSSH token。条件块中的 Include 不用于枚举 Host。
 
-开始复制前，pdo 会通过 `ssh -G` 验证所有 Host 的 OpenSSH 配置；验证全部通过后依次执行 `ssh-copy-id -i <identity> -F <config> <host>`。`ssh-copy-id` 自行判断公钥是否已经安装，其密码、私钥口令和 host-key 确认直接使用当前终端。某个 Host 失败不会阻止后续 Host，最终有任一失败时退出 `1`。
+开始复制前，pdo 会通过 `ssh -G` 验证所有 Host 的 OpenSSH 配置；验证全部通过后，macOS 和 Linux 依次执行 `ssh-copy-id -i <identity> -F <config> <host>`，Windows 则通过 `ssh` 将公钥写入远端 `~/.ssh/authorized_keys`。Windows 会按公钥主体查重，即使注释不同也不会重复写入。密码、私钥口令和 host-key 确认直接使用当前终端。某个 Host 失败不会阻止后续 Host，最终有任一失败时退出 `1`。
 
-所有平台都要求 `ssh` 和 `ssh-copy-id` 可从 `PATH` 找到。Windows OpenSSH 通常不附带 `ssh-copy-id`，需要用户自行安装兼容实现；缺少工具时该命令会在连接前失败，其他 pdo 命令不受影响。
+所有平台都要求 `ssh` 可从 `PATH` 找到；macOS 和 Linux 还需要 `ssh-copy-id`。Windows 只需启用系统的 OpenSSH Client。
 
 ## 更新
 
 `pdo update --check` 只检查 GitHub 上的最新稳定 Release，不写入本地文件。`pdo update` 会校验同一 Release 中的 `SHA256SUMS`、验证候选二进制版本，然后替换当前实际执行文件。
 
-更新时会先锁定 `~/.config/pdo/.update-transaction`，备份需要迁移的 pdo 配置或数据以及旧二进制。迁移或切换失败会恢复已修改内容；恢复失败时会保留事务目录并输出路径。成功后会删除配置和数据备份。pdo 不扫描目录、不执行远程迁移脚本，也不会修改配置中列出的 dotfiles。
-
-普通 `go build` 生成的开发版本显示为 `pdo devel`，并拒绝执行更新。v0.1.0 是首个自更新基线，可使用 `pdo update` 升级到后续稳定版本。
+普通 `go build` 生成的开发版本显示为 `pdo devel`，并拒绝执行更新。
 
 ## 卸载
 
@@ -209,4 +205,4 @@ go test ./...
 go build .
 ```
 
-推送 `v*` tag 会注入 tag 作为版本号，并在测试通过后发布 macOS、Linux、Windows 的 `amd64` / `arm64` 二进制、安装与卸载脚本及 `SHA256SUMS`。v0.1.0 及后续 Release tag 均不可移动或替换资产。
+推送 `v*` tag 会注入 tag 作为版本号，并在测试通过后发布 macOS、Linux、Windows 的 `amd64` / `arm64` 二进制、安装与卸载脚本及 `SHA256SUMS`。

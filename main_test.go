@@ -1034,8 +1034,9 @@ func TestRunCopySSHIDPreflightsThenContinues(t *testing.T) {
 	writeTestFile(t, filepath.Join(sshDir, "id_test"), "private")
 	writeTestFile(t, filepath.Join(sshDir, "id_test.pub"), "public")
 
-	previousFind, previousRun := findCommand, runCommand
-	t.Cleanup(func() { findCommand, runCommand = previousFind, previousRun })
+	previousFind, previousRun, previousGOOS := findCommand, runCommand, copySSHIDGOOS
+	t.Cleanup(func() { findCommand, runCommand, copySSHIDGOOS = previousFind, previousRun, previousGOOS })
+	copySSHIDGOOS = "linux"
 	findCommand = func(name string) (string, error) { return "/mock/" + name, nil }
 	type call struct {
 		name string
@@ -1070,6 +1071,73 @@ func TestRunCopySSHIDPreflightsThenContinues(t *testing.T) {
 	}
 }
 
+func TestRunCopySSHIDWindowsUsesSSH(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(sshDir, "config"), "Host Alpha\n")
+	writeTestFile(t, filepath.Join(sshDir, "id"), "private")
+	writeTestFile(t, filepath.Join(sshDir, "id.pub"), "ssh-ed25519 AAAA test\r\n")
+
+	previousFind, previousRun, previousGOOS := findCommand, runCommand, copySSHIDGOOS
+	t.Cleanup(func() { findCommand, runCommand, copySSHIDGOOS = previousFind, previousRun, previousGOOS })
+	copySSHIDGOOS = "windows"
+	findCommand = func(name string) (string, error) {
+		if name == "ssh-copy-id" {
+			t.Fatal("Windows looked for ssh-copy-id")
+		}
+		return "/mock/ssh", nil
+	}
+	var installArgs []string
+	var installedKey string
+	runCommand = func(name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+		if args[0] == "-G" {
+			return nil
+		}
+		installArgs = append([]string(nil), args...)
+		key, err := io.ReadAll(stdin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		installedKey = string(key)
+		return nil
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"copy-ssh-id", "--identity=~/.ssh/id"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	config := filepath.Join(sshDir, "config")
+	wantArgs := []string{"-F", config, "Alpha", windowsSSHCopyIDCommand}
+	if strings.Join(installArgs, "|") != strings.Join(wantArgs, "|") || installedKey != "ssh-ed25519 AAAA test\n" {
+		t.Fatalf("args=%v key=%q", installArgs, installedKey)
+	}
+}
+
+func TestWindowsSSHCopyIDCommandAvoidsDuplicateKey(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	home := t.TempDir()
+	for _, key := range []string{"ssh-ed25519 AAAA first\n", "ssh-ed25519 AAAA changed-comment\n"} {
+		command := exec.Command("sh", "-c", windowsSSHCopyIDCommand)
+		command.Env = append(os.Environ(), "HOME="+home)
+		command.Stdin = strings.NewReader(key)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("command failed: %v: %s", err, output)
+		}
+	}
+	content, err := os.ReadFile(filepath.Join(home, ".ssh", "authorized_keys"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "ssh-ed25519 AAAA first\n" {
+		t.Fatalf("authorized_keys=%q", content)
+	}
+}
+
 func TestRunCopySSHIDPreflightFailurePreventsCopies(t *testing.T) {
 	home := t.TempDir()
 	setHome(t, home)
@@ -1081,8 +1149,9 @@ func TestRunCopySSHIDPreflightFailurePreventsCopies(t *testing.T) {
 	writeTestFile(t, filepath.Join(sshDir, "id"), "private")
 	writeTestFile(t, filepath.Join(sshDir, "id.pub"), "public")
 
-	previousFind, previousRun := findCommand, runCommand
-	t.Cleanup(func() { findCommand, runCommand = previousFind, previousRun })
+	previousFind, previousRun, previousGOOS := findCommand, runCommand, copySSHIDGOOS
+	t.Cleanup(func() { findCommand, runCommand, copySSHIDGOOS = previousFind, previousRun, previousGOOS })
+	copySSHIDGOOS = "linux"
 	findCommand = func(name string) (string, error) { return name, nil }
 	copyCalls := 0
 	runCommand = func(name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -1116,8 +1185,9 @@ func TestCopySSHIDRequiresToolsAndLiteralHosts(t *testing.T) {
 	writeTestFile(t, filepath.Join(sshDir, "id"), "private")
 	writeTestFile(t, filepath.Join(sshDir, "id.pub"), "public")
 
-	previousFind := findCommand
-	t.Cleanup(func() { findCommand = previousFind })
+	previousFind, previousGOOS := findCommand, copySSHIDGOOS
+	t.Cleanup(func() { findCommand, copySSHIDGOOS = previousFind, previousGOOS })
+	copySSHIDGOOS = "linux"
 	findCommand = func(name string) (string, error) {
 		if name == "ssh-copy-id" {
 			return "", errors.New("missing")
