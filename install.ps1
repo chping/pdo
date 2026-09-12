@@ -47,7 +47,10 @@ try {
 
     $pdoConfigDir = Join-Path ([Environment]::GetFolderPath("UserProfile")) ".config\pdo"
     $pdoConfig = Join-Path $pdoConfigDir "config.json"
-    if (-not (Test-Path -LiteralPath $pdoConfig)) {
+    $pdoCreateDefaultConfig = {
+        if (Test-Path -LiteralPath $pdoConfig) {
+            return
+        }
         New-Item -ItemType Directory -Force -Path $pdoConfigDir | Out-Null
         $pdoTemplate = @'
 {
@@ -79,7 +82,25 @@ try {
         Write-Warning "$pdoInstallDir is not in PATH. Add it with:"
         Write-Host "[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';$pdoInstallDir', 'User')"
     }
-    Write-Host "Edit $pdoConfig and set the configured password/token environment variables."
+    $pdoRunSetup = $false
+    if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+        try {
+            $pdoRunSetup = (Read-Host "Run pdo setup now? [y/N]") -match '^(?i:y|yes)$'
+        }
+        catch {
+            $pdoRunSetup = $false
+        }
+    }
+    if ($pdoRunSetup) {
+        & (Join-Path $pdoInstallDir "pdo.exe") setup
+        if ($LASTEXITCODE -ne 0) {
+            throw "pdo: setup failed; pdo remains installed at $pdoInstallDir\pdo.exe"
+        }
+    }
+    else {
+        & $pdoCreateDefaultConfig
+        Write-Host "Edit $pdoConfig and set the configured password/token environment variables, or run pdo setup."
+    }
 }
 finally {
     Remove-Item -LiteralPath $pdoTempDir -Recurse -Force -ErrorAction SilentlyContinue

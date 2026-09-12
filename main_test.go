@@ -97,6 +97,190 @@ func TestLoadConfigSchemaAndUnknownSection(t *testing.T) {
 	}
 }
 
+func TestSetupWritesConfigAndPrivateEnvironment(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	remote := remoteURL("ssh/config")
+	stdout, stderr, code := runSetupForTest(t, remote+"\nhttps://clipboard.example.com/api/\nteam\n", "github-secret-value", "clipboard-secret-value")
+	if code != 0 || stderr.String() == "" || !strings.Contains(stdout.String(), "Configured pdo") {
+		t.Fatalf("setup code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	configPath := filepath.Join(home, ".config", "pdo", "config.json")
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(configData), "github-secret-value") || strings.Contains(string(configData), "clipboard-secret-value") {
+		t.Fatalf("config contains a secret: %s", configData)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(configData, &document); err != nil {
+		t.Fatal(err)
+	}
+	var cfg config
+	if err := json.Unmarshal(configData, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GitHub.PATEnv != githubPATEnvName || cfg.Dotfiles["ssh-config"].Remote != remote || cfg.Dotfiles["ssh-config"].Local != defaultSSHConfigLocal || cfg.CloudClipboard.Host != "https://clipboard.example.com/api" || cfg.CloudClipboard.Room != "team" || cfg.CloudClipboard.PasswordEnv != clipboardPasswordEnv {
+		t.Fatalf("config=%+v", cfg)
+	}
+	if string(document["schema_version"]) != "1" {
+		t.Fatalf("schema_version=%s", document["schema_version"])
+	}
+	envPath := filepath.Join(home, ".config", "pdo", pdoEnvFileName)
+	environment, _, err := readPDOEnv(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if environment[githubPATEnvName] != "github-secret-value" || environment[clipboardPasswordEnv] != "clipboard-secret-value" {
+		t.Fatalf("environment=%v", environment)
+	}
+	if runtime.GOOS != "windows" {
+		assertMode(t, configPath, 0o600)
+		assertMode(t, envPath, 0o600)
+	}
+
+	for _, name := range []string{githubPATEnvName, clipboardPasswordEnv} {
+		previous, exists := os.LookupEnv(name)
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if exists {
+				os.Setenv(name, previous)
+			} else {
+				os.Unsetenv(name)
+			}
+		})
+	}
+	if err := loadPDOEnv(home); err != nil || os.Getenv(githubPATEnvName) != "github-secret-value" || os.Getenv(clipboardPasswordEnv) != "clipboard-secret-value" {
+		t.Fatalf("load pdo environment error=%v PAT=%q password=%q", err, os.Getenv(githubPATEnvName), os.Getenv(clipboardPasswordEnv))
+	}
+	if err := os.Setenv(githubPATEnvName, "external-value"); err != nil {
+		t.Fatal(err)
+	}
+	if err := loadPDOEnv(home); err != nil || os.Getenv(githubPATEnvName) != "external-value" {
+		t.Fatalf("external environment override error=%v PAT=%q", err, os.Getenv(githubPATEnvName))
+	}
+}
+
+func TestSetupPreservesExistingConfigAndSecrets(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	configDir := filepath.Join(home, ".config", "pdo")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "actual-config.json")
+	original := []byte(`{"schema_version":1,"future":{"keep":true},"github":{"pat_env":"OLD_PAT","custom":true},"dotfiles":{"git-config":{"remote":"https://github.com/owner/repo/blob/main/gitconfig","local":"~/.gitconfig"},"ssh-config":{"remote":"https://github.com/owner/repo/blob/main/ssh/config","local":"~/.ssh/custom","custom":true}},"cloud_clipboard":{"host":"https://clipboard.example.com/","room":"old-room","password_env":"OLD_PASSWORD","custom":true}}`)
+	if err := os.WriteFile(target, original, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(configDir, "config.json")
+	if err := os.Symlink(target, configPath); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	envPath := filepath.Join(configDir, pdoEnvFileName)
+	if err := os.WriteFile(envPath, []byte(`{"PDO_GITHUB_PAT":"old-pat","PDO_CLOUD_CLIPBOARD_PASSWORD":"old-password","OTHER":"keep"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code := runSetupForTest(t, "\n\n", "")
+	if code != 0 || stderr.String() == "" || !strings.Contains(stdout.String(), "Configured pdo") {
+		t.Fatalf("setup code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	var future struct {
+		Keep bool `json:"keep"`
+	}
+	if err := json.Unmarshal(document["future"], &future); err != nil || !future.Keep {
+		t.Fatalf("future=%s error=%v", document["future"], err)
+	}
+	var github, dotfiles, sshConfig, cloud map[string]json.RawMessage
+	if err := json.Unmarshal(document["github"], &github); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(document["dotfiles"], &dotfiles); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(dotfiles["ssh-config"], &sshConfig); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(document["cloud_clipboard"], &cloud); err != nil {
+		t.Fatal(err)
+	}
+	if string(github["pat_env"]) != `"PDO_GITHUB_PAT"` || string(github["custom"]) != "true" || dotfiles["git-config"] == nil || string(sshConfig["local"]) != `"~/.ssh/custom"` || string(sshConfig["custom"]) != "true" || string(cloud["password_env"]) != `"OLD_PASSWORD"` || string(cloud["custom"]) != "true" {
+		t.Fatalf("document=%s", data)
+	}
+	environment, _, err := readPDOEnv(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if environment[githubPATEnvName] != "old-pat" || environment[clipboardPasswordEnv] != "old-password" || environment["OTHER"] != "keep" {
+		t.Fatalf("environment=%v", environment)
+	}
+	if info, err := os.Lstat(configPath); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("config link changed: info=%v error=%v", info, err)
+	}
+	if runtime.GOOS != "windows" {
+		assertMode(t, target, 0o640)
+		assertMode(t, envPath, 0o600)
+	}
+}
+
+func TestSetupAllowsNoCloudClipboardAndRejectsInvalidInput(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	remote := remoteURL("ssh/config")
+	stdout, stderr, code := runSetupForTest(t, remote+"\n\n", "secret")
+	if code != 0 || stderr.String() == "" || !strings.Contains(stdout.String(), "Configured pdo") {
+		t.Fatalf("setup code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".config", "pdo", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := document["cloud_clipboard"]; ok {
+		t.Fatalf("unexpected cloud clipboard config: %s", data)
+	}
+
+	invalidHome := t.TempDir()
+	setHome(t, invalidHome)
+	stdout, stderr, code = runSetupForTest(t, "not-a-github-url\n", "secret")
+	if code != 1 || !strings.Contains(stderr.String(), "GitHub file URL") {
+		t.Fatalf("invalid setup code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(invalidHome, ".config", "pdo", "config.json")); !os.IsNotExist(err) {
+		t.Fatalf("invalid setup wrote config: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(invalidHome, ".config", "pdo", pdoEnvFileName)); !os.IsNotExist(err) {
+		t.Fatalf("invalid setup wrote environment: %v", err)
+	}
+
+	previousInput, previousTerminal := setupInput, isSetupTerminal
+	setupInput = os.Stdin
+	isSetupTerminal = func(*os.File) bool { return false }
+	t.Cleanup(func() { setupInput, isSetupTerminal = previousInput, previousTerminal })
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"setup"}, stdout, stderr); code != 1 || !strings.Contains(stderr.String(), "interactive terminal") {
+		t.Fatalf("noninteractive setup code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if code := run([]string{"setup", "extra"}, stdout, stderr); code != 2 {
+		t.Fatalf("setup args code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestCloudClipboardConfigValidation(t *testing.T) {
 	t.Setenv("PDO_CLOUD_CLIPBOARD_PASSWORD", "secret")
 	valid := config{CloudClipboard: cloudClipboardConfig{
@@ -191,6 +375,27 @@ func TestCloudClipboardTextAndImageCommands(t *testing.T) {
 	}
 	if code := run([]string{"paste"}, &stdout, &stderr); code != 0 || stdout.String() != text || writtenKind != "text" || string(writtenData) != text {
 		t.Fatalf("paste code=%d stdout=%q stderr=%q kind=%q data=%q", code, stdout.String(), stderr.String(), writtenKind, writtenData)
+	}
+	previousTerminal := isTerminal
+	isTerminal = func(io.Writer) bool { return true }
+	t.Cleanup(func() { isTerminal = previousTerminal })
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"paste"}, &stdout, &stderr); code != 0 || stdout.String() != text+"\n" {
+		t.Fatalf("terminal paste code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	if code := run([]string{"copy", "already has a newline\n"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("newline copy code=%d stderr=%q", code, stderr.String())
+	}
+	if code := run([]string{"paste"}, &stdout, &stderr); code != 0 || stdout.String() != "already has a newline\n" {
+		t.Fatalf("newline terminal paste code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	isTerminal = previousTerminal
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"copy", text}, &stdout, &stderr); code != 0 {
+		t.Fatalf("restore text copy code=%d stderr=%q", code, stderr.String())
 	}
 
 	writeClipboard = func(string, []byte) error {
@@ -1652,6 +1857,35 @@ func setHome(t *testing.T, home string) {
 	t.Helper()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
+}
+
+func runSetupForTest(t *testing.T, inputText string, secrets ...string) (*bytes.Buffer, *bytes.Buffer, int) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "setup-input")
+	if err := os.WriteFile(path, []byte(inputText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	input, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousInput, previousTerminal, previousSecret := setupInput, isSetupTerminal, readSetupSecret
+	setupInput = input
+	isSetupTerminal = func(*os.File) bool { return true }
+	readSetupSecret = func(*os.File) ([]byte, error) {
+		if len(secrets) == 0 {
+			return nil, io.EOF
+		}
+		secret := secrets[0]
+		secrets = secrets[1:]
+		return []byte(secret), nil
+	}
+	t.Cleanup(func() {
+		setupInput, isSetupTerminal, readSetupSecret = previousInput, previousTerminal, previousSecret
+		input.Close()
+	})
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	return stdout, stderr, run([]string{"setup"}, stdout, stderr)
 }
 
 func writeConfig(t *testing.T, home string, dotfiles map[string]dotfileConfig) {

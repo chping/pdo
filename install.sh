@@ -57,7 +57,10 @@ mv -f "$pdo_staged" "$pdo_install_dir/pdo"
 
 pdo_config_dir="$HOME/.config/pdo"
 pdo_config="$pdo_config_dir/config.json"
-if [ ! -e "$pdo_config" ] && [ ! -L "$pdo_config" ]; then
+pdo_create_default_config() {
+  if [ -e "$pdo_config" ] || [ -L "$pdo_config" ]; then
+    return
+  fi
   umask 077
   mkdir -p "$pdo_config_dir"
   cat >"$pdo_config" <<'EOF'
@@ -80,11 +83,29 @@ if [ ! -e "$pdo_config" ] && [ ! -L "$pdo_config" ]; then
 }
 EOF
   echo "Created $pdo_config"
-fi
+}
 
 echo "Installed pdo to $pdo_install_dir/pdo"
 case ":$PATH:" in
   *":$pdo_install_dir:"*) ;;
   *) echo "Add $pdo_install_dir to PATH before running pdo." ;;
 esac
-echo "Edit $pdo_config and set the configured password/token environment variables."
+
+pdo_run_setup=0
+if (: </dev/tty) 2>/dev/null && (: >/dev/tty) 2>/dev/null; then
+  printf 'Run pdo setup now? [y/N] ' >/dev/tty
+  if IFS= read -r pdo_answer </dev/tty; then
+    case "$pdo_answer" in
+      [Yy]|[Yy][Ee][Ss]) pdo_run_setup=1 ;;
+    esac
+  fi
+fi
+if [ "$pdo_run_setup" -eq 1 ]; then
+  if ! "$pdo_install_dir/pdo" setup </dev/tty >/dev/tty 2>/dev/tty; then
+    echo "pdo: setup failed; pdo remains installed at $pdo_install_dir/pdo" >&2
+    exit 1
+  fi
+else
+  pdo_create_default_config
+  echo "Edit $pdo_config and set the configured password/token environment variables, or run pdo setup."
+fi

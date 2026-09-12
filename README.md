@@ -16,13 +16,18 @@ Windows PowerShell：
 irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
 ```
 
-安装器会识别 `amd64` / `arm64`、验证 SHA-256，并仅在配置不存在时创建模板。它不会修改 PATH 或覆盖已有配置。
+安装器会识别 `amd64` / `arm64`、验证 SHA-256，并在交互终端询问是否立即运行 `pdo setup`。选择否（或没有交互终端）时，仅在配置不存在时创建模板。它不会修改 PATH 或覆盖已有配置。
 
 - macOS / Linux：`~/.local/bin/pdo`
 - Windows：`%LOCALAPPDATA%\Programs\pdo\pdo.exe`
 - 所有平台配置：`~/.config/pdo/config.json`
+- 私有凭据：`~/.config/pdo/env.json`（仅 `pdo` 自动加载）
 
 ## 配置
+
+推荐在终端运行 `pdo setup`。它会隐藏输入 GitHub PAT 和剪贴板密码，引导填写 SSH config 的 GitHub 文件链接及可选剪贴板服务，并将凭据写入 `~/.config/pdo/env.json`（Unix 上权限为 `0600`）。`pdo` 会自动加载该文件；不会修改启动它的 shell 配置，且当前 shell 中已设置的同名环境变量优先。
+
+也可以手工编辑配置：
 
 ```json
 {
@@ -79,7 +84,7 @@ irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
    - `room`：设备间共享的房间前缀。pdo 自动使用 `<room>-pdo-clipboard` 和 `<room>-pdo-file` 两个独立房间。
    - `password_env`：保存密码的环境变量名，不是密码本身。
 
-4. 在每台设备上设置与服务端 `AUTH_PASSWORD` 相同的密码：
+4. 在每台设备上设置与服务端 `AUTH_PASSWORD` 相同的密码。`pdo setup` 会将它保存到私有 env 文件；也可以手工设置环境变量（环境变量优先）：
 
    ```sh
    export PDO_CLOUD_CLIPBOARD_PASSWORD="your-password"
@@ -95,7 +100,7 @@ irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
 
 dotfile 名称使用 kebab-case，并对应命令行的 `--<名称>`。`remote` 使用 GitHub 文件页面的标准链接 `https://github.com/OWNER/REPOSITORY/blob/BRANCH/PATH`；`local` 必须以 `~/` 开头或使用当前平台的绝对路径。pdo 会在内部将文件链接转换为 GitHub Contents API 请求。
 
-创建一个仅能访问目标私有仓库的 GitHub fine-grained personal access token，并赋予 Contents 读写权限。token 只从配置指定的环境变量读取：
+创建一个仅能访问目标私有仓库的 GitHub fine-grained personal access token，并赋予 Contents 读写权限。`pdo setup` 会保存它到私有 env 文件；也可以手工设置配置指定的环境变量（环境变量优先）：
 
 ```sh
 export PDO_GITHUB_PAT="your-token"
@@ -110,6 +115,9 @@ $env:PDO_GITHUB_PAT = "your-token"
 ## 使用
 
 ```sh
+# 交互式写入 GitHub、SSH config 和可选剪贴板配置
+pdo setup
+
 # 同步配置中的全部 dotfiles
 pdo download dotfiles
 pdo upload dotfiles

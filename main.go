@@ -21,6 +21,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/term"
 )
 
 const (
@@ -31,9 +33,16 @@ const (
 	maxCloudControlResponse = 64 << 10
 	maxCloudTextResponse    = 6*maxClipboardPayload + maxCloudControlResponse
 	cloudUploadChunkSize    = 1 << 20
+	maxSetupInputLength     = 8192
+	pdoEnvFileName          = "env.json"
+	githubPATEnvName        = "PDO_GITHUB_PAT"
+	clipboardPasswordEnv    = "PDO_CLOUD_CLIPBOARD_PASSWORD"
+	defaultClipboardRoom    = "personal"
+	defaultSSHConfigLocal   = "~/.ssh/config"
 	usage                   = `Usage:
   pdo download dotfiles [--<name> ...]
   pdo upload dotfiles [--<name> ...]
+  pdo setup
   pdo copy ["text"]
   pdo paste
   pdo copy-file <file_path>
@@ -64,6 +73,13 @@ var (
 	writeClipboard  = systemClipboardWrite
 	cloudHTTPClient = func() *http.Client {
 		return &http.Client{Timeout: 10 * time.Minute}
+	}
+	setupInput      = os.Stdin
+	isSetupTerminal = func(input *os.File) bool {
+		return term.IsTerminal(int(input.Fd()))
+	}
+	readSetupSecret = func(input *os.File) ([]byte, error) {
+		return term.ReadPassword(int(input.Fd()))
 	}
 	isTerminal = func(writer io.Writer) bool {
 		file, ok := writer.(*os.File)
@@ -228,6 +244,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, usage)
 		return 0
 	}
+	if len(args) > 0 && args[0] == "setup" {
+		if len(args) != 1 {
+			fmt.Fprintln(stderr, usage)
+			return 2
+		}
+		if err := runSetup(stdout, stderr); err != nil {
+			fmt.Fprintf(stderr, "pdo: setup: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 	if len(args) > 0 && (args[0] == "copy" || args[0] == "paste" || args[0] == "copy-file" || args[0] == "paste-file") {
 		valid := (args[0] == "copy" && len(args) <= 2) ||
 			(args[0] == "paste" && len(args) == 1) ||
@@ -323,6 +350,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "pdo: %v\n", err)
 		return 1
 	}
+	if err := loadPDOEnv(home); err != nil {
+		fmt.Fprintf(stderr, "pdo: %v\n", err)
+		return 1
+	}
 	prepared, err := cfg.prepareDotfiles(home)
 	if err != nil {
 		fmt.Fprintf(stderr, "pdo: %v\n", err)
@@ -388,6 +419,9 @@ func runCloudClipboard(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if err := loadPDOEnv(home); err != nil {
+		return err
+	}
 	client, err := cfg.prepareCloudClipboard()
 	if err != nil {
 		return err
@@ -449,6 +483,9 @@ func runCloudClipboard(args []string, stdout, stderr io.Writer) error {
 		}
 		if kind == "text" {
 			_, err = stdout.Write(data)
+			if err == nil && len(data) != 0 && data[len(data)-1] != '\n' && isTerminal(stdout) {
+				_, err = fmt.Fprintln(stdout)
+			}
 		} else {
 			_, err = fmt.Fprintf(stdout, "image/png %dx%d %d bytes\n", width, height, len(data))
 		}
@@ -551,16 +588,9 @@ func runCloudClipboard(args []string, stdout, stderr io.Writer) error {
 
 func (cfg config) prepareCloudClipboard() (*cloudClipboardClient, error) {
 	item := cfg.CloudClipboard
-	room := strings.TrimSpace(item.Room)
-	if item.Host == "" || room == "" || item.PasswordEnv == "" {
-		return nil, fmt.Errorf("cloud_clipboard.host, room, and password_env are required; Webdis prefix/username configuration is no longer supported")
-	}
-	parsed, err := url.Parse(item.Host)
+	room, err := validateCloudClipboardConfig(item)
 	if err != nil {
-		return nil, fmt.Errorf("cloud_clipboard.host: invalid URL: %w", err)
-	}
-	if parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(item.Host, "#") {
-		return nil, fmt.Errorf("cloud_clipboard.host must be an HTTPS cloud-clipboard-go base URL without credentials, query, or fragment")
+		return nil, err
 	}
 	password := os.Getenv(item.PasswordEnv)
 	if password == "" {
@@ -749,6 +779,21 @@ func (client *cloudClipboardClient) deleteFile(room, uuid string) {
 		io.Copy(io.Discard, io.LimitReader(response.Body, maxCloudControlResponse))
 		response.Body.Close()
 	}
+}
+
+func validateCloudClipboardConfig(item cloudClipboardConfig) (string, error) {
+	room := strings.TrimSpace(item.Room)
+	if item.Host == "" || room == "" || item.PasswordEnv == "" {
+		return "", fmt.Errorf("cloud_clipboard.host, room, and password_env are required; Webdis prefix/username configuration is no longer supported")
+	}
+	parsed, err := url.Parse(item.Host)
+	if err != nil {
+		return "", fmt.Errorf("cloud_clipboard.host: invalid URL: %w", err)
+	}
+	if parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(item.Host, "#") {
+		return "", fmt.Errorf("cloud_clipboard.host must be an HTTPS cloud-clipboard-go base URL without credentials, query, or fragment")
+	}
+	return room, nil
 }
 
 func (client *cloudClipboardClient) downloadFile(room, uuid string, size int64, writer io.Writer) (int64, error) {
@@ -1555,6 +1600,321 @@ func loadConfig(path string) (config, error) {
 		return config{}, fmt.Errorf("unsupported schema_version %d (expected %d)", cfg.SchemaVersion, supportedSchemaVersion)
 	}
 	return cfg, nil
+}
+
+func runSetup(stdout, stderr io.Writer) error {
+	if !isSetupTerminal(setupInput) {
+		return fmt.Errorf("an interactive terminal is required")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("find home directory: %w", err)
+	}
+	configPath := filepath.Join(home, ".config", "pdo", "config.json")
+	document, configTarget, configMode, err := readSetupDocument(configPath, "config")
+	if err != nil {
+		return err
+	}
+	if raw, ok := document["schema_version"]; ok {
+		var schemaVersion int
+		if err := json.Unmarshal(raw, &schemaVersion); err != nil || schemaVersion != supportedSchemaVersion {
+			return fmt.Errorf("unsupported schema_version in %s (expected %d)", configPath, supportedSchemaVersion)
+		}
+	} else {
+		document["schema_version"] = json.RawMessage(strconv.Itoa(supportedSchemaVersion))
+	}
+
+	envPath := filepath.Join(home, ".config", "pdo", pdoEnvFileName)
+	environment, envTarget, err := readPDOEnv(envPath)
+	if err != nil {
+		return err
+	}
+	github, err := setupJSONObject(document, "github")
+	if err != nil {
+		return err
+	}
+	dotfiles, err := setupJSONObject(document, "dotfiles")
+	if err != nil {
+		return err
+	}
+	sshConfig, err := setupJSONObject(dotfiles, "ssh-config")
+	if err != nil {
+		return err
+	}
+	existingRemote, err := setupJSONString(sshConfig, "remote")
+	if err != nil {
+		return err
+	}
+	local, err := setupJSONString(sshConfig, "local")
+	if err != nil {
+		return err
+	}
+	if local == "" {
+		local = defaultSSHConfigLocal
+	}
+	if _, err := expandLocalPath(home, local); err != nil {
+		return fmt.Errorf("dotfiles.ssh-config.local: %w", err)
+	}
+
+	pat, err := readSetupSecretValue(setupInput, stderr, "GitHub personal access token (leave blank to keep existing): ")
+	if err != nil {
+		return err
+	}
+	if pat == "" {
+		pat = environment[githubPATEnvName]
+	}
+	if pat == "" {
+		return fmt.Errorf("a GitHub personal access token is required")
+	}
+	if err := validateSetupSecret(pat); err != nil {
+		return fmt.Errorf("GitHub personal access token: %w", err)
+	}
+
+	remote, err := readSetupLine(setupInput, stderr, "SSH config GitHub file URL", existingRemote)
+	if err != nil {
+		return err
+	}
+	if remote == "" {
+		remote = existingRemote
+	}
+	if _, _, _, err := parseRemote(remote); err != nil {
+		return fmt.Errorf("SSH config GitHub file URL: %w", err)
+	}
+
+	cloud, err := setupJSONObject(document, "cloud_clipboard")
+	if err != nil {
+		return err
+	}
+	existingHost, err := setupJSONString(cloud, "host")
+	if err != nil {
+		return err
+	}
+	host, err := readSetupLine(setupInput, stderr, "Cloud clipboard service URL (leave blank to keep existing or skip)", existingHost)
+	if err != nil {
+		return err
+	}
+	if host != "" {
+		existingRoom, err := setupJSONString(cloud, "room")
+		if err != nil {
+			return err
+		}
+		if existingRoom == "" {
+			existingRoom = defaultClipboardRoom
+		}
+		room, err := readSetupLine(setupInput, stderr, "Cloud clipboard room", existingRoom)
+		if err != nil {
+			return err
+		}
+		if room == "" {
+			room = existingRoom
+		}
+		password, err := readSetupSecretValue(setupInput, stderr, "Cloud clipboard password (leave blank to keep existing): ")
+		if err != nil {
+			return err
+		}
+		if password == "" {
+			password = environment[clipboardPasswordEnv]
+		}
+		if password == "" {
+			return fmt.Errorf("a cloud clipboard password is required")
+		}
+		if err := validateSetupSecret(password); err != nil {
+			return fmt.Errorf("cloud clipboard password: %w", err)
+		}
+		normalizedHost := strings.TrimRight(host, "/")
+		if _, err := validateCloudClipboardConfig(cloudClipboardConfig{Host: normalizedHost, Room: room, PasswordEnv: clipboardPasswordEnv}); err != nil {
+			return err
+		}
+		if err := setSetupJSON(cloud, "host", normalizedHost); err != nil {
+			return err
+		}
+		if err := setSetupJSON(cloud, "room", room); err != nil {
+			return err
+		}
+		if err := setSetupJSON(cloud, "password_env", clipboardPasswordEnv); err != nil {
+			return err
+		}
+		if err := setSetupJSON(document, "cloud_clipboard", cloud); err != nil {
+			return err
+		}
+		environment[clipboardPasswordEnv] = password
+	}
+
+	if err := setSetupJSON(github, "pat_env", githubPATEnvName); err != nil {
+		return err
+	}
+	if err := setSetupJSON(document, "github", github); err != nil {
+		return err
+	}
+	if err := setSetupJSON(sshConfig, "remote", remote); err != nil {
+		return err
+	}
+	if err := setSetupJSON(sshConfig, "local", local); err != nil {
+		return err
+	}
+	if err := setSetupJSON(dotfiles, "ssh-config", sshConfig); err != nil {
+		return err
+	}
+	if err := setSetupJSON(document, "dotfiles", dotfiles); err != nil {
+		return err
+	}
+	environment[githubPATEnvName] = pat
+
+	configData, err := json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode config: %w", err)
+	}
+	envData, err := json.MarshalIndent(environment, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode pdo environment: %w", err)
+	}
+	if err := atomicWriteFile(envTarget, append(envData, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write pdo environment: %w", err)
+	}
+	if err := atomicWriteFile(configTarget, append(configData, '\n'), configMode); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	fmt.Fprintf(stdout, "Configured pdo in %s.\n", configPath)
+	return nil
+}
+
+func readSetupDocument(path, label string) (map[string]json.RawMessage, string, os.FileMode, error) {
+	target, info, err := inspectLocalFile(path)
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("inspect %s: %w", label, err)
+	}
+	if info == nil {
+		return make(map[string]json.RawMessage), target, 0o600, nil
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("read %s: %w", label, err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(data, &document); err != nil || document == nil {
+		if err == nil {
+			err = fmt.Errorf("must be a JSON object")
+		}
+		return nil, "", 0, fmt.Errorf("parse %s: %w", label, err)
+	}
+	return document, target, info.Mode().Perm(), nil
+}
+
+func readPDOEnv(path string) (map[string]string, string, error) {
+	document, target, _, err := readSetupDocument(path, "pdo environment")
+	if err != nil {
+		return nil, "", err
+	}
+	environment := make(map[string]string, len(document))
+	for name, raw := range document {
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return nil, "", fmt.Errorf("parse pdo environment %s: %w", name, err)
+		}
+		environment[name] = value
+	}
+	return environment, target, nil
+}
+
+func loadPDOEnv(home string) error {
+	environment, _, err := readPDOEnv(filepath.Join(home, ".config", "pdo", pdoEnvFileName))
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{githubPATEnvName, clipboardPasswordEnv} {
+		if value, ok := environment[name]; ok {
+			if _, exists := os.LookupEnv(name); !exists {
+				if err := os.Setenv(name, value); err != nil {
+					return fmt.Errorf("set %s: %w", name, err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func setupJSONObject(document map[string]json.RawMessage, name string) (map[string]json.RawMessage, error) {
+	raw, ok := document[name]
+	if !ok {
+		return make(map[string]json.RawMessage), nil
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		if err == nil {
+			err = fmt.Errorf("must be a JSON object")
+		}
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+	return object, nil
+}
+
+func setupJSONString(document map[string]json.RawMessage, name string) (string, error) {
+	raw, ok := document[name]
+	if !ok {
+		return "", nil
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", fmt.Errorf("%s: %w", name, err)
+	}
+	return value, nil
+}
+
+func setSetupJSON(document map[string]json.RawMessage, name string, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	document[name] = data
+	return nil
+}
+
+func readSetupLine(input *os.File, output io.Writer, prompt, defaultValue string) (string, error) {
+	if defaultValue == "" {
+		fmt.Fprintf(output, "%s: ", prompt)
+	} else {
+		fmt.Fprintf(output, "%s [%s]: ", prompt, defaultValue)
+	}
+	line := make([]byte, 0, 64)
+	var single [1]byte
+	for {
+		n, err := input.Read(single[:])
+		if n != 0 {
+			switch single[0] {
+			case '\n':
+				return strings.TrimSpace(string(line)), nil
+			case '\r':
+			default:
+				line = append(line, single[0])
+				if len(line) > maxSetupInputLength {
+					return "", fmt.Errorf("input is too long")
+				}
+			}
+		}
+		if err != nil {
+			if err == io.EOF && len(line) != 0 {
+				return strings.TrimSpace(string(line)), nil
+			}
+			return "", fmt.Errorf("read input: %w", err)
+		}
+	}
+}
+
+func readSetupSecretValue(input *os.File, output io.Writer, prompt string) (string, error) {
+	fmt.Fprint(output, prompt)
+	value, err := readSetupSecret(input)
+	fmt.Fprintln(output)
+	if err != nil {
+		return "", fmt.Errorf("read secret: %w", err)
+	}
+	return string(value), nil
+}
+
+func validateSetupSecret(value string) error {
+	if strings.ContainsAny(value, "\x00\r\n") {
+		return fmt.Errorf("must not contain NUL or newlines")
+	}
+	return nil
 }
 
 func (cfg config) prepareDotfiles(home string) (map[string]preparedDotfile, error) {
