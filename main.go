@@ -445,7 +445,7 @@ func runCloudClipboard(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		if err := writeClipboard(kind, data); err != nil {
-			return err
+			fmt.Fprintf(stderr, "pdo: paste: warning: system clipboard unavailable: %v; falling back to stdout\n", err)
 		}
 		if kind == "text" {
 			_, err = stdout.Write(data)
@@ -961,7 +961,7 @@ func linuxClipboardWrite(kind string, data []byte) error {
 	if os.Getenv("WAYLAND_DISPLAY") != "" {
 		command, err := findCommand("wl-copy")
 		if err != nil {
-			return fmt.Errorf("wl-copy is required; install wl-clipboard")
+			return fmt.Errorf("wl-copy is required; install with: %s", linuxClipboardInstallCommand("wl-clipboard"))
 		}
 		mimeType := "text/plain;charset=utf-8"
 		if kind == "image-png" {
@@ -970,9 +970,12 @@ func linuxClipboardWrite(kind string, data []byte) error {
 		_, err = clipboardCommandOutput(command, []string{"--type", mimeType}, bytes.NewReader(data))
 		return err
 	}
+	if os.Getenv("DISPLAY") == "" {
+		return fmt.Errorf("no graphical clipboard session (DISPLAY and WAYLAND_DISPLAY are unset); start a Wayland or X11 session and install clipboard support with: %s", linuxClipboardInstallCommand("wl-clipboard xclip"))
+	}
 	command, err := findCommand("xclip")
 	if err != nil {
-		return fmt.Errorf("xclip is required; install xclip")
+		return fmt.Errorf("xclip is required; install with: %s", linuxClipboardInstallCommand("xclip"))
 	}
 	mimeType := "text/plain;charset=utf-8"
 	if kind == "image-png" {
@@ -980,6 +983,19 @@ func linuxClipboardWrite(kind string, data []byte) error {
 	}
 	_, err = clipboardCommandOutput(command, []string{"-selection", "clipboard", "-target", mimeType, "-in"}, bytes.NewReader(data))
 	return err
+}
+
+func linuxClipboardInstallCommand(packageName string) string {
+	if _, err := findCommand("apt"); err == nil {
+		return "sudo apt install " + packageName
+	}
+	if _, err := findCommand("dnf"); err == nil {
+		return "sudo dnf install " + packageName
+	}
+	if _, err := findCommand("pacman"); err == nil {
+		return "sudo pacman -S " + packageName
+	}
+	return fmt.Sprintf("sudo apt install %s (or sudo dnf install %s, or sudo pacman -S %s)", packageName, packageName, packageName)
 }
 
 func macOSClipboardRead() (string, []byte, error) {

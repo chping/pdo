@@ -122,7 +122,7 @@ pdo upload dotfiles --ssh-config --git-config
 pdo copy "text"
 pdo copy
 
-# 设备 B：下载最近的文本/图片，写入系统剪贴板并在终端输出
+# 设备 B：下载最近的文本/图片；系统剪贴板不可用时仍在终端输出
 pdo paste
 
 # 设备 A 上传文件；设备 B 下载到当前目录或指定的已存在目录
@@ -146,7 +146,7 @@ pdo --help
 
 文本/图片与文件分别使用 `<room>-pdo-clipboard` 和 `<room>-pdo-file`，单项最大 64 MiB。历史条数和文件过期时间遵循 cloud-clipboard-go 的 `MESSAGE_NUM`、`FILE_EXPIRE` 配置；pdo 不扫描历史。`copy-file` 和 `paste-file` 仅在 stderr 连接终端时显示传输进度；下载遇到同名文件会使用 `name (1).ext` 等新名称，不覆盖已有文件。
 
-macOS 使用系统 AppKit 剪贴板，Windows 使用 PowerShell/.NET。Linux Wayland 需要 `wl-clipboard`，X11 需要 `xclip`；剪贴板同时含图片和文本时优先使用图片。
+macOS 使用系统 AppKit 剪贴板，Windows 使用 PowerShell/.NET。Linux Wayland 需要 `wl-clipboard`（`sudo apt install wl-clipboard`、`sudo dnf install wl-clipboard` 或 `sudo pacman -S wl-clipboard`），X11 需要 `xclip`（`sudo apt install xclip`、`sudo dnf install xclip` 或 `sudo pacman -S xclip`）。没有 Wayland/X11 图形会话或剪贴板写入失败时，`pdo paste` 会提示原因并仍将文本或图片摘要输出到终端；剪贴板同时含图片和文本时优先使用图片。
 
 批量同步按配置名称排序执行；指定多个选择器时按参数顺序执行。某项失败不会阻止后续项目，最终只要有一项失败，命令就返回退出码 `1`。
 

@@ -177,11 +177,12 @@ func TestCloudClipboardTextAndImageCommands(t *testing.T) {
 	t.Cleanup(func() { readClipboard, writeClipboard = previousRead, previousWrite })
 	var writtenKind string
 	var writtenData []byte
-	writeClipboard = func(kind string, data []byte) error {
+	recordClipboardWrite := func(kind string, data []byte) error {
 		writtenKind = kind
 		writtenData = append([]byte(nil), data...)
 		return nil
 	}
+	writeClipboard = recordClipboardWrite
 
 	text := "中文\n\"quoted\"\x00"
 	var stdout, stderr bytes.Buffer
@@ -191,6 +192,16 @@ func TestCloudClipboardTextAndImageCommands(t *testing.T) {
 	if code := run([]string{"paste"}, &stdout, &stderr); code != 0 || stdout.String() != text || writtenKind != "text" || string(writtenData) != text {
 		t.Fatalf("paste code=%d stdout=%q stderr=%q kind=%q data=%q", code, stdout.String(), stderr.String(), writtenKind, writtenData)
 	}
+
+	writeClipboard = func(string, []byte) error {
+		return errors.New("clipboard command failed: Error: Can't open display: (null)")
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"paste"}, &stdout, &stderr); code != 0 || stdout.String() != text || !strings.Contains(stderr.String(), "warning: system clipboard unavailable") || !strings.Contains(stderr.String(), "falling back to stdout") {
+		t.Fatalf("clipboard fallback code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	writeClipboard = recordClipboardWrite
 
 	stdout.Reset()
 	stderr.Reset()
@@ -205,6 +216,14 @@ func TestCloudClipboardTextAndImageCommands(t *testing.T) {
 	if code := run([]string{"paste"}, &stdout, &stderr); code != 0 || stdout.String() != fmt.Sprintf("image/png 2x3 %d bytes\n", imageData.Len()) || writtenKind != "image-png" || !bytes.Equal(writtenData, imageData.Bytes()) {
 		t.Fatalf("image paste code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
+
+	writeClipboard = func(string, []byte) error { return errors.New("clipboard unavailable") }
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"paste"}, &stdout, &stderr); code != 0 || stdout.String() != fmt.Sprintf("image/png 2x3 %d bytes\n", imageData.Len()) || !strings.Contains(stderr.String(), "falling back to stdout") {
+		t.Fatalf("image clipboard fallback code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	writeClipboard = recordClipboardWrite
 
 	fixture.setFile("personal-pdo-clipboard", "clipboard.png", []byte("not a png"))
 	writtenKind = "unchanged"
@@ -498,6 +517,66 @@ func TestClipboardPlatformCommands(t *testing.T) {
 			t.Fatalf("written=%q error=%v", written, err)
 		}
 	})
+
+	t.Run("Linux clipboard availability", func(t *testing.T) {
+		findCommand = func(name string) (string, error) { return name, nil }
+		t.Setenv("WAYLAND_DISPLAY", "")
+		t.Setenv("DISPLAY", "")
+		called := false
+		runCommand = func(string, []string, io.Reader, io.Writer, io.Writer) error {
+			called = true
+			return nil
+		}
+		err := linuxClipboardWrite("text", []byte("text"))
+		if err == nil || !strings.Contains(err.Error(), "no graphical clipboard session") || !strings.Contains(err.Error(), "sudo apt install wl-clipboard xclip") || called {
+			t.Fatalf("error=%v command called=%t", err, called)
+		}
+	})
+
+	t.Run("Linux missing clipboard tools show install commands", func(t *testing.T) {
+		cases := []struct {
+			name        string
+			wayland     bool
+			missing     string
+			manager     string
+			wantCommand string
+		}{
+			{"Wayland apt", true, "wl-copy", "apt", "sudo apt install wl-clipboard"},
+			{"X11 dnf", false, "xclip", "dnf", "sudo dnf install xclip"},
+			{"Wayland pacman", true, "wl-copy", "pacman", "sudo pacman -S wl-clipboard"},
+		}
+		for _, test := range cases {
+			t.Run(test.name, func(t *testing.T) {
+				if test.wayland {
+					t.Setenv("WAYLAND_DISPLAY", "wayland-0")
+					t.Setenv("DISPLAY", "")
+				} else {
+					t.Setenv("WAYLAND_DISPLAY", "")
+					t.Setenv("DISPLAY", ":0")
+				}
+				findCommand = func(name string) (string, error) {
+					if name == test.manager {
+						return name, nil
+					}
+					return "", errors.New("not found")
+				}
+				err := linuxClipboardWrite("text", []byte("text"))
+				if err == nil || !strings.Contains(err.Error(), test.wantCommand) {
+					t.Fatalf("error=%v", err)
+				}
+			})
+		}
+
+		findCommand = func(string) (string, error) { return "", errors.New("not found") }
+		t.Setenv("WAYLAND_DISPLAY", "")
+		t.Setenv("DISPLAY", ":0")
+		err := linuxClipboardWrite("text", []byte("text"))
+		if err == nil || !strings.Contains(err.Error(), "sudo apt install xclip") || !strings.Contains(err.Error(), "sudo dnf install xclip") || !strings.Contains(err.Error(), "sudo pacman -S xclip") {
+			t.Fatalf("fallback install command error=%v", err)
+		}
+	})
+
+	findCommand = func(name string) (string, error) { return name, nil }
 
 	t.Run("macOS raw text", func(t *testing.T) {
 		calls := 0
