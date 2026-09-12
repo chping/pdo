@@ -157,6 +157,9 @@ func TestSetupWritesConfigAndPrivateEnvironment(t *testing.T) {
 		t.Fatalf("schema_version=%s", document["schema_version"])
 	}
 	envPath := filepath.Join(home, ".config", "pdo", pdoEnvFileName)
+	if !strings.Contains(stdout.String(), envPath) {
+		t.Fatalf("setup did not report environment path: %q", stdout.String())
+	}
 	environment, _, err := readPDOEnv(home)
 	if err != nil {
 		t.Fatal(err)
@@ -217,8 +220,8 @@ func TestSetupPreservesExistingConfigAndSecrets(t *testing.T) {
 	if err := os.WriteFile(legacyEnvPath, []byte(`{"PDO_GITHUB_PAT":"old-pat","PDO_CLOUD_CLIPBOARD_PASSWORD":"old-password","OTHER":"keep"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	stdout, stderr, code := runSetupForTest(t, "\n\n", "")
-	if code != 0 || stderr.String() == "" || !strings.Contains(stdout.String(), "Configured pdo") {
+	stdout, stderr, code := runSetupForTest(t, "\n\n\n", "", "")
+	if code != 0 || !strings.Contains(stderr.String(), "Cloud clipboard password") || !strings.Contains(stdout.String(), "Configured pdo") {
 		t.Fatalf("setup code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 	data, err := os.ReadFile(target)
@@ -248,7 +251,7 @@ func TestSetupPreservesExistingConfigAndSecrets(t *testing.T) {
 	if err := json.Unmarshal(document["cloud_clipboard"], &cloud); err != nil {
 		t.Fatal(err)
 	}
-	if string(github["pat_env"]) != `"PDO_GITHUB_PAT"` || string(github["custom"]) != "true" || dotfiles["git-config"] == nil || string(sshConfig["local"]) != `"~/.ssh/custom"` || string(sshConfig["custom"]) != "true" || string(cloud["password_env"]) != `"OLD_PASSWORD"` || string(cloud["custom"]) != "true" {
+	if string(github["pat_env"]) != `"PDO_GITHUB_PAT"` || string(github["custom"]) != "true" || dotfiles["git-config"] == nil || string(sshConfig["local"]) != `"~/.ssh/custom"` || string(sshConfig["custom"]) != "true" || string(cloud["password_env"]) != `"PDO_CLOUD_CLIPBOARD_PASSWORD"` || string(cloud["custom"]) != "true" {
 		t.Fatalf("document=%s", data)
 	}
 	envPath := filepath.Join(configDir, pdoEnvFileName)
@@ -1149,7 +1152,7 @@ func TestRunCopySSHIDTargetHost(t *testing.T) {
 	}
 }
 
-func TestRunCopySSHIDWindowsUsesSSH(t *testing.T) {
+func TestRunCopySSHIDDirectFallbackUsesSSH(t *testing.T) {
 	home := t.TempDir()
 	setHome(t, home)
 	sshDir := filepath.Join(home, ".ssh")
@@ -1162,45 +1165,52 @@ func TestRunCopySSHIDWindowsUsesSSH(t *testing.T) {
 
 	previousFind, previousRun, previousGOOS := findCommand, runCommand, copySSHIDGOOS
 	t.Cleanup(func() { findCommand, runCommand, copySSHIDGOOS = previousFind, previousRun, previousGOOS })
-	copySSHIDGOOS = "windows"
-	findCommand = func(name string) (string, error) {
-		if name == "ssh-copy-id" {
-			t.Fatal("Windows looked for ssh-copy-id")
-		}
-		return "/mock/ssh", nil
-	}
-	var installArgs []string
-	var installedKey string
-	runCommand = func(name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
-		if args[0] == "-G" {
-			return nil
-		}
-		installArgs = append([]string(nil), args...)
-		key, err := io.ReadAll(stdin)
-		if err != nil {
-			t.Fatal(err)
-		}
-		installedKey = string(key)
-		return nil
-	}
-	var stdout, stderr bytes.Buffer
-	if code := run([]string{"copy-ssh-id", "--identity=~/.ssh/id"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
-	}
 	config := filepath.Join(sshDir, "config")
-	wantArgs := []string{"-F", config, "Alpha", windowsSSHCopyIDCommand}
-	if strings.Join(installArgs, "|") != strings.Join(wantArgs, "|") || installedKey != "ssh-ed25519 AAAA test\n" {
-		t.Fatalf("args=%v key=%q", installArgs, installedKey)
+	for _, goos := range []string{"windows", "linux"} {
+		t.Run(goos, func(t *testing.T) {
+			copySSHIDGOOS = goos
+			findCommand = func(name string) (string, error) {
+				if name == "ssh-copy-id" {
+					if goos == "windows" {
+						t.Fatal("Windows looked for ssh-copy-id")
+					}
+					return "", errors.New("missing")
+				}
+				return "/mock/ssh", nil
+			}
+			var installArgs []string
+			var installedKey string
+			runCommand = func(name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+				if args[0] == "-G" {
+					return nil
+				}
+				installArgs = append([]string(nil), args...)
+				key, err := io.ReadAll(stdin)
+				if err != nil {
+					t.Fatal(err)
+				}
+				installedKey = string(key)
+				return nil
+			}
+			var stdout, stderr bytes.Buffer
+			if code := run([]string{"copy-ssh-id", "--identity=~/.ssh/id"}, &stdout, &stderr); code != 0 {
+				t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+			}
+			wantArgs := []string{"-F", config, "Alpha", directSSHCopyIDCommand}
+			if strings.Join(installArgs, "|") != strings.Join(wantArgs, "|") || installedKey != "ssh-ed25519 AAAA test\n" {
+				t.Fatalf("args=%v key=%q", installArgs, installedKey)
+			}
+		})
 	}
 }
 
-func TestWindowsSSHCopyIDCommandAvoidsDuplicateKey(t *testing.T) {
+func TestDirectSSHCopyIDCommandAvoidsDuplicateKey(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX shell")
 	}
 	home := t.TempDir()
 	for _, key := range []string{"ssh-ed25519 AAAA first\n", "ssh-ed25519 AAAA changed-comment\n"} {
-		command := exec.Command("sh", "-c", windowsSSHCopyIDCommand)
+		command := exec.Command("sh", "-c", directSSHCopyIDCommand)
 		command.Env = append(os.Environ(), "HOME="+home)
 		command.Stdin = strings.NewReader(key)
 		if output, err := command.CombinedOutput(); err != nil {
@@ -1267,18 +1277,92 @@ func TestCopySSHIDRequiresToolsAndLiteralHosts(t *testing.T) {
 	t.Cleanup(func() { findCommand, copySSHIDGOOS = previousFind, previousGOOS })
 	copySSHIDGOOS = "linux"
 	findCommand = func(name string) (string, error) {
-		if name == "ssh-copy-id" {
+		if name == "ssh" {
 			return "", errors.New("missing")
 		}
 		return name, nil
 	}
-	if _, err := copySSHID(copySSHIDOptions{identity: filepath.Join(sshDir, "id")}, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "ssh-copy-id was not found") {
+	if _, err := copySSHID(copySSHIDOptions{identity: filepath.Join(sshDir, "id")}, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "ssh was not found") {
 		t.Fatalf("tool error=%v", err)
 	}
 
 	writeTestFile(t, config, "Host *.example !blocked\n")
 	if _, err := copySSHID(copySSHIDOptions{identity: filepath.Join(sshDir, "id")}, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "no literal Host") {
 		t.Fatalf("empty hosts error=%v", err)
+	}
+}
+
+func TestDependencyPlans(t *testing.T) {
+	previousFind, previousRun := findCommand, runCommand
+	t.Cleanup(func() { findCommand, runCommand = previousFind, previousRun })
+	runCommand = func(_ string, args []string, _ io.Reader, stdout, _ io.Writer) error {
+		if len(args) == 1 && args[0] == "-V" {
+			fmt.Fprint(stdout, "OpenSSH_9.0")
+		}
+		return nil
+	}
+	t.Setenv("DISPLAY", "")
+	t.Setenv("WAYLAND_DISPLAY", "")
+
+	for _, test := range []struct {
+		name      string
+		goos      string
+		openWrt   bool
+		available map[string]bool
+		wayland   bool
+		want      string
+		wantErr   string
+	}{
+		{name: "OpenWrt opkg", goos: "linux", openWrt: true, available: map[string]bool{"opkg": true}, want: "opkg install openssh-client"},
+		{name: "OpenWrt apk", goos: "linux", openWrt: true, available: map[string]bool{"apk": true}, want: "apk add openssh-client"},
+		{name: "Linux Wayland", goos: "linux", available: map[string]bool{"ssh": true, "apt-get": true}, wayland: true, want: "apt-get install -y wl-clipboard"},
+		{name: "Windows", goos: "windows", available: map[string]bool{"powershell.exe": true}, want: "Add-WindowsCapability"},
+		{name: "macOS", goos: "darwin", available: map[string]bool{"ssh": true}, wantErr: "macOS system components"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.wayland {
+				t.Setenv("WAYLAND_DISPLAY", "wayland-0")
+			}
+			findCommand = func(name string) (string, error) {
+				if test.available[name] {
+					return name, nil
+				}
+				return "", errors.New("missing")
+			}
+			_, commands, err := dependencyPlan(test.goos, test.openWrt, true)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("error=%v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			display := ""
+			for _, command := range commands {
+				display += command.display + "\n"
+			}
+			if !strings.Contains(display, test.want) {
+				t.Fatalf("commands=%q want %q", display, test.want)
+			}
+		})
+	}
+}
+
+func TestLinuxDependencyPackageNames(t *testing.T) {
+	for _, test := range []struct{ manager, want string }{
+		{manager: "apt-get", want: "openssh-client"},
+		{manager: "dnf", want: "openssh-clients"},
+		{manager: "yum", want: "openssh-clients"},
+		{manager: "pacman", want: "openssh"},
+		{manager: "apk", want: "openssh-client-default"},
+		{manager: "zypper", want: "openssh-clients"},
+	} {
+		packages := linuxDependencyPackages(test.manager, false, true, false, false)
+		if len(packages) != 1 || packages[0] != test.want {
+			t.Fatalf("manager=%s packages=%v", test.manager, packages)
+		}
 	}
 }
 
@@ -1999,15 +2083,20 @@ func TestUpdateRejectsBadHashAndCandidateVersion(t *testing.T) {
 	}
 	asset, _ := updateAssetName(runtime.GOOS, runtime.GOARCH)
 	for _, test := range []struct {
-		name string
-		tag  string
-		sum  string
-		want string
+		name             string
+		tag              string
+		sum              string
+		dependenciesFail bool
+		want             string
 	}{
 		{name: "hash", tag: "v0.1.1", sum: strings.Repeat("0", 64), want: "checksum verification failed"},
 		{name: "version", tag: "v0.1.2", sum: fmt.Sprintf("%x", sha256.Sum256(binary)), want: "candidate version mismatch"},
+		{name: "dependencies", tag: "v0.1.1", sum: fmt.Sprintf("%x", sha256.Sum256(binary)), dependenciesFail: true, want: "candidate dependency check failed"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			if test.dependenciesFail {
+				t.Setenv("PDO_TEST_DEPENDENCIES_FAIL", "1")
+			}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case r.URL.Path == "/releases/latest":
@@ -2081,6 +2170,7 @@ func buildCandidate(t *testing.T, candidateVersion string) string {
 import ("fmt"; "os")
 func main() {
  if len(os.Args) == 2 && os.Args[1] == "version" { fmt.Println("pdo ` + candidateVersion + `"); return }
+ if len(os.Args) == 2 && os.Args[1] == "__pdo-dependencies" { if os.Getenv("PDO_TEST_DEPENDENCIES_FAIL") == "1" { os.Exit(1) }; return }
  if len(os.Args) == 4 && os.Args[1] == "__pdo-migrate" { fmt.Println("0"); return }
  os.Exit(2)
 }`

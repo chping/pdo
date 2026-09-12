@@ -32,9 +32,47 @@ jobs:
           [void][scriptblock]::Create((Get-Content -Raw install.ps1))
           [void][scriptblock]::Create((Get-Content -Raw uninstall.ps1))
 
+  openwrt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Test BusyBox install on OpenWrt stable
+        shell: bash
+        run: |
+          mkdir .openwrt-assets
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o .openwrt-assets/pdo_linux_amd64 .
+          (cd .openwrt-assets && sha256sum pdo_linux_amd64 > SHA256SUMS)
+          cp install.sh .openwrt-assets/install.sh
+          sed -i 's#^pdo_base_url=.*#pdo_base_url="http://127.0.0.1:18080"#' .openwrt-assets/install.sh
+          python3 -m http.server 18080 --directory .openwrt-assets >/tmp/pdo-openwrt-http.log 2>&1 &
+          pdo_server=$!
+          trap 'kill "$pdo_server"' EXIT
+          for pdo_attempt in {1..50}; do
+            if curl -fsS http://127.0.0.1:18080/SHA256SUMS >/dev/null; then break; fi
+            sleep 0.1
+          done
+          curl -fsS http://127.0.0.1:18080/SHA256SUMS >/dev/null
+          docker run --rm --network host -v "$PWD/.openwrt-assets:/assets:ro" openwrt/rootfs:x86_64-24.10.8 sh -ec '
+            mkdir -p /var/lock
+            if /assets/pdo_linux_amd64 __pdo-dependencies >/tmp/dependencies 2>&1; then
+              echo "dependency check unexpectedly accepted Dropbear" >&2
+              exit 1
+            fi
+            grep -q "opkg install openssh-client" /tmp/dependencies
+            opkg update
+            opkg install openssh-client
+            opkg list-installed | grep -q "^dropbear "
+            wget -qO- http://127.0.0.1:18080/install.sh | sh
+            /root/.local/bin/pdo version | grep -q "pdo devel"
+          '
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: test
+    needs: [test, openwrt]
     runs-on: ubuntu-latest
     permissions:
       contents: write

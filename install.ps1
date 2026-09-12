@@ -39,6 +39,11 @@ try {
         throw "pdo: checksum verification failed"
     }
 
+    & $pdoDownload "__pdo-dependencies"
+    if ($LASTEXITCODE -ne 0) {
+        throw "pdo: dependency check failed"
+    }
+
     $pdoInstallDir = Join-Path ([Environment]::GetFolderPath("LocalApplicationData")) "Programs\pdo"
     New-Item -ItemType Directory -Force -Path $pdoInstallDir | Out-Null
     $pdoStaged = Join-Path $pdoInstallDir (".pdo-" + $PID + ".tmp")

@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -218,6 +219,12 @@ type copySSHIDOptions struct {
 	targetHost string
 }
 
+type dependencyCommand struct {
+	name    string
+	args    []string
+	display string
+}
+
 func main() {
 	args := os.Args[1:]
 	if !(len(args) == 2 && args[0] == "update" && args[1] == "--check") {
@@ -236,7 +243,18 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 1 && args[0] == "__pdo-dependencies" {
+		if err := ensureDependencies(os.Stdin, isSetupTerminal(os.Stdin), true, stdout, stderr); err != nil {
+			fmt.Fprintf(stderr, "pdo: dependencies: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 	if len(args) == 3 && args[0] == "__pdo-migrate" {
+		if err := ensureDependencies(nil, false, false, stdout, stderr); err != nil {
+			fmt.Fprintf(stderr, "pdo: migrate: dependencies: %v\n", err)
+			return 1
+		}
 		count, err := runInternalMigrations(args[1], args[2])
 		if err != nil {
 			fmt.Fprintf(stderr, "pdo: migrate: %v\n", err)
@@ -1257,7 +1275,7 @@ if ($args[1] -eq 'image-png') {
     [Windows.Forms.Clipboard]::SetDataObject($text, $true)
 }`
 
-const windowsSSHCopyIDCommand = `umask 077; mkdir -p "$HOME/.ssh" && touch "$HOME/.ssh/authorized_keys" && chmod 700 "$HOME/.ssh" && chmod 600 "$HOME/.ssh/authorized_keys" && IFS= read -r key && key_data=$(printf '%s\n' "$key" | awk '{print $2}') && [ -n "$key_data" ] && { awk -v key="$key_data" '{ for (i = 1; i <= NF; i++) if ($i == key) found = 1 } END { exit !found }' "$HOME/.ssh/authorized_keys" || printf '%s\n' "$key" >> "$HOME/.ssh/authorized_keys"; }`
+const directSSHCopyIDCommand = `umask 077; mkdir -p "$HOME/.ssh" && touch "$HOME/.ssh/authorized_keys" && chmod 700 "$HOME/.ssh" && chmod 600 "$HOME/.ssh/authorized_keys" && IFS= read -r key && key_data=$(printf '%s\n' "$key" | awk '{print $2}') && [ -n "$key_data" ] && { awk -v key="$key_data" '{ for (i = 1; i <= NF; i++) if ($i == key) found = 1 } END { exit !found }' "$HOME/.ssh/authorized_keys" || printf '%s\n' "$key" >> "$HOME/.ssh/authorized_keys"; }`
 
 func parseCopySSHIDArgs(args []string) (copySSHIDOptions, error) {
 	var options copySSHIDOptions
@@ -1362,7 +1380,12 @@ func copySSHID(options copySSHIDOptions, stdout, stderr io.Writer) (bool, error)
 	}
 	sshCopyID := ""
 	var publicKey []byte
-	if copySSHIDGOOS == "windows" {
+	directCopy := copySSHIDGOOS == "windows"
+	if !directCopy {
+		sshCopyID, err = findCommand("ssh-copy-id")
+		directCopy = err != nil
+	}
+	if directCopy {
 		publicKey, err = os.ReadFile(options.identity + ".pub")
 		if err != nil {
 			return false, fmt.Errorf("read public identity key: %w", err)
@@ -1372,11 +1395,6 @@ func copySSHID(options copySSHIDOptions, stdout, stderr io.Writer) (bool, error)
 			return false, fmt.Errorf("public identity key is empty")
 		}
 		publicKey = append(publicKey, '\n')
-	} else {
-		sshCopyID, err = findCommand("ssh-copy-id")
-		if err != nil {
-			return false, fmt.Errorf("ssh-copy-id was not found in PATH")
-		}
 	}
 	for _, host := range hosts {
 		var commandError bytes.Buffer
@@ -1395,9 +1413,9 @@ func copySSHID(options copySSHIDOptions, stdout, stderr io.Writer) (bool, error)
 		arguments := []string{"-i", options.identity, "-F", options.config, host}
 		var stdin io.Reader = os.Stdin
 		label := "ssh-copy-id"
-		if copySSHIDGOOS == "windows" {
+		if directCopy {
 			command = ssh
-			arguments = []string{"-F", options.config, host, windowsSSHCopyIDCommand}
+			arguments = []string{"-F", options.config, host, directSSHCopyIDCommand}
 			stdin = bytes.NewReader(publicKey)
 			label = "ssh"
 		}
@@ -1747,6 +1765,9 @@ func runSetup(stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if host == "" {
+		host = existingHost
+	}
 	if host != "" {
 		existingRoom, err := setupJSONString(cloud, "room")
 		if err != nil {
@@ -1828,7 +1849,7 @@ func runSetup(stdout, stderr io.Writer) error {
 	if err := atomicWriteFile(configTarget, append(configData, '\n'), configMode); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
-	fmt.Fprintf(stdout, "Configured pdo in %s.\n", configPath)
+	fmt.Fprintf(stdout, "Configured pdo in %s.\nCredentials saved to %s.\n", configPath, filepath.Join(filepath.Dir(configPath), pdoEnvFileName))
 	return nil
 }
 
@@ -2405,6 +2426,196 @@ func compareVersions(left, right semanticVersion) int {
 	return 0
 }
 
+const windowsOpenSSHInstallScript = `$process = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList '-NoProfile -NonInteractive -Command "Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0 | Out-Null"'; exit $process.ExitCode`
+
+func commandAvailable(name string) bool {
+	_, err := findCommand(name)
+	return err == nil
+}
+
+func openSSHAvailable() bool {
+	ssh, err := findCommand("ssh")
+	if err != nil {
+		return false
+	}
+	var output bytes.Buffer
+	return runCommand(ssh, []string{"-V"}, nil, &output, &output) == nil && strings.Contains(output.String(), "OpenSSH")
+}
+
+func openWrtHost() bool {
+	if _, err := os.Stat("/etc/openwrt_release"); err == nil {
+		return true
+	}
+	data, err := os.ReadFile("/etc/os-release")
+	return err == nil && regexp.MustCompile(`(?m)^ID=["']?openwrt["']?$`).Match(data)
+}
+
+func rootUser() bool {
+	current, err := user.Current()
+	return err == nil && current.Uid == "0"
+}
+
+func linuxPackageManager(openWrt bool) string {
+	candidates := []string{"apt-get", "dnf", "yum", "pacman", "apk", "zypper"}
+	if openWrt {
+		candidates = []string{"opkg", "apk"}
+	}
+	for _, candidate := range candidates {
+		if commandAvailable(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func linuxDependencyPackages(manager string, openWrt, needSSH, needWayland, needX11 bool) []string {
+	packages := make([]string, 0, 3)
+	if needSSH {
+		switch {
+		case openWrt:
+			packages = append(packages, "openssh-client")
+		case manager == "apt-get":
+			packages = append(packages, "openssh-client")
+		case manager == "dnf" || manager == "yum" || manager == "zypper":
+			packages = append(packages, "openssh-clients")
+		case manager == "pacman":
+			packages = append(packages, "openssh")
+		case manager == "apk":
+			packages = append(packages, "openssh-client-default")
+		}
+	}
+	if needWayland {
+		packages = append(packages, "wl-clipboard")
+	} else if needX11 {
+		packages = append(packages, "xclip")
+	}
+	return packages
+}
+
+func linuxDependencyCommands(manager string, packages []string, root bool) ([]dependencyCommand, error) {
+	if len(packages) == 0 {
+		return nil, nil
+	}
+	commands := []dependencyCommand{}
+	add := func(args ...string) {
+		commands = append(commands, dependencyCommand{name: manager, args: args, display: strings.Join(append([]string{manager}, args...), " ")})
+	}
+	switch manager {
+	case "apt-get":
+		add("update")
+		add(append([]string{"install", "-y"}, packages...)...)
+	case "dnf", "yum":
+		add(append([]string{"install", "-y"}, packages...)...)
+	case "pacman":
+		add(append([]string{"-Sy", "--needed", "--noconfirm"}, packages...)...)
+	case "apk":
+		add(append([]string{"add"}, packages...)...)
+	case "zypper":
+		add(append([]string{"--non-interactive", "install"}, packages...)...)
+	case "opkg":
+		add("update")
+		add(append([]string{"install"}, packages...)...)
+	default:
+		return nil, fmt.Errorf("no supported package manager was found")
+	}
+	if root {
+		return commands, nil
+	}
+	if !commandAvailable("sudo") {
+		return commands, fmt.Errorf("sudo was not found; run the commands above as root")
+	}
+	for index := range commands {
+		commands[index].args = append([]string{commands[index].name}, commands[index].args...)
+		commands[index].name = "sudo"
+		commands[index].display = "sudo " + commands[index].display
+	}
+	return commands, nil
+}
+
+func dependencyPlan(goos string, openWrt, root bool) ([]string, []dependencyCommand, error) {
+	missing := []string{}
+	needSSH := !openSSHAvailable()
+	if needSSH {
+		missing = append(missing, "OpenSSH client")
+	}
+	switch goos {
+	case "darwin":
+		if !commandAvailable("osascript") {
+			missing = append(missing, "osascript")
+		}
+		if len(missing) != 0 {
+			return missing, nil, fmt.Errorf("required macOS system components are missing; repair or reinstall macOS Command Line Tools")
+		}
+	case "windows":
+		if !commandAvailable("powershell.exe") {
+			missing = append(missing, "Windows PowerShell")
+			return missing, nil, fmt.Errorf("Windows PowerShell is missing; repair it in Windows optional features")
+		}
+		if needSSH {
+			return missing, []dependencyCommand{{
+				name:    "powershell.exe",
+				args:    []string{"-NoProfile", "-NonInteractive", "-Command", windowsOpenSSHInstallScript},
+				display: "Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0 (Administrator)",
+			}}, nil
+		}
+	case "linux":
+		needWayland := !openWrt && os.Getenv("WAYLAND_DISPLAY") != "" && (!commandAvailable("wl-copy") || !commandAvailable("wl-paste"))
+		needX11 := !openWrt && !needWayland && os.Getenv("WAYLAND_DISPLAY") == "" && os.Getenv("DISPLAY") != "" && !commandAvailable("xclip")
+		if needWayland {
+			missing = append(missing, "wl-clipboard")
+		} else if needX11 {
+			missing = append(missing, "xclip")
+		}
+		if len(missing) != 0 {
+			manager := linuxPackageManager(openWrt)
+			if manager == "" {
+				return missing, nil, fmt.Errorf("no supported package manager was found")
+			}
+			commands, err := linuxDependencyCommands(manager, linuxDependencyPackages(manager, openWrt, needSSH, needWayland, needX11), root)
+			return missing, commands, err
+		}
+	default:
+		return nil, nil, fmt.Errorf("unsupported operating system: %s", goos)
+	}
+	return missing, nil, nil
+}
+
+func ensureDependencies(stdin io.Reader, interactive, install bool, stdout, stderr io.Writer) error {
+	missing, commands, planErr := dependencyPlan(runtime.GOOS, openWrtHost(), rootUser())
+	if len(missing) == 0 {
+		return nil
+	}
+	fmt.Fprintf(stderr, "pdo: missing dependencies: %s\n", strings.Join(missing, ", "))
+	if len(commands) != 0 {
+		fmt.Fprintln(stderr, "pdo: install with:")
+		for _, command := range commands {
+			fmt.Fprintf(stderr, "  %s\n", command.display)
+		}
+	}
+	if planErr != nil {
+		return planErr
+	}
+	if !install || !interactive {
+		return fmt.Errorf("install the missing dependencies and retry")
+	}
+	fmt.Fprint(stderr, "Install missing dependencies now? [y/N] ")
+	answer, _ := bufio.NewReader(stdin).ReadString('\n')
+	answer = strings.TrimSpace(answer)
+	if !strings.EqualFold(answer, "y") && !strings.EqualFold(answer, "yes") {
+		return fmt.Errorf("dependency installation declined")
+	}
+	for _, command := range commands {
+		if err := runCommand(command.name, command.args, nil, stdout, stderr); err != nil {
+			return fmt.Errorf("run %s: %w", command.display, err)
+		}
+	}
+	missing, _, err := dependencyPlan(runtime.GOOS, openWrtHost(), rootUser())
+	if err != nil || len(missing) != 0 {
+		return fmt.Errorf("dependencies are still missing after installation")
+	}
+	return nil
+}
+
 func newUpdater(timeout time.Duration) (updater, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -2427,7 +2638,7 @@ func newUpdater(timeout time.Duration) (updater, error) {
 }
 
 func automaticUpdate(args []string, stdin io.Reader, interactive bool, stdout, stderr io.Writer, install func(updater, release, io.Writer) error) bool {
-	if version == "devel" || (len(args) > 0 && (args[0] == "update" || args[0] == "__pdo-migrate")) {
+	if version == "devel" || (len(args) > 0 && (args[0] == "update" || strings.HasPrefix(args[0], "__pdo-"))) {
 		return false
 	}
 	u, err := newUpdater(automaticUpdateTimeout)
@@ -2619,6 +2830,13 @@ func (u updater) install(found release, stdout io.Writer) error {
 	}
 	if err := verifyExecutableVersion(stagedPath, found.TagName); err != nil {
 		return err
+	}
+	dependencyCheck := exec.Command(stagedPath, "__pdo-dependencies")
+	dependencyCheck.Stdin = os.Stdin
+	dependencyCheck.Stdout = stdout
+	dependencyCheck.Stderr = os.Stderr
+	if err := dependencyCheck.Run(); err != nil {
+		return fmt.Errorf("candidate dependency check failed: %w", err)
 	}
 
 	tx, err := startTransaction(u.home)

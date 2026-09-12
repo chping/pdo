@@ -10,15 +10,23 @@ macOS / Linux：
 curl -fsSL https://github.com/chping/pdo/releases/latest/download/install.sh | sh
 ```
 
+OpenWrt（BusyBox `wget`）：
+
+```sh
+wget -qO- https://github.com/chping/pdo/releases/latest/download/install.sh | sh
+```
+
 Windows PowerShell：
 
 ```powershell
 irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
 ```
 
-安装器会识别 `amd64` / `arm64`、验证 SHA-256，并在交互终端询问是否立即运行 `pdo setup`。选择否（或没有交互终端）时，仅在配置不存在时创建模板。Windows 安装器会将安装目录加入用户 PATH（当前 PowerShell 立即可用）；macOS / Linux 不修改 PATH，也不会覆盖已有配置。
+安装器会识别 `amd64` / `arm64`、验证 SHA-256，并在替换二进制前检查依赖。Linux 支持 `apt-get`、`dnf`、`yum`、`pacman`、`apk`、`zypper`，OpenWrt 支持 `opkg` 和新版 `apk`；缺少依赖时会显示安装命令并在交互终端询问是否安装，非交互安装会显示命令后退出。非 root 用户使用 `sudo`，OpenWrt 的 Dropbear 客户端会保留，并安装 OpenSSH 客户端供 pdo 使用。macOS 缺失系统组件时应修复系统组件，安装器不会安装 Homebrew。
 
-- macOS / Linux：`~/.local/bin/pdo`
+依赖满足后，安装器会询问是否立即运行 `pdo setup`。选择否（或没有交互终端）时，仅在配置不存在时创建模板。Windows 安装器会将安装目录加入用户 PATH（当前 PowerShell 立即可用）；macOS / Linux / OpenWrt 不修改 PATH，也不会覆盖已有配置。
+
+- macOS / Linux / OpenWrt：`~/.local/bin/pdo`
 - Windows：`%LOCALAPPDATA%\Programs\pdo\pdo.exe`
 - 所有平台配置：`~/.config/pdo/config.json`
 - 私有凭据：`~/.config/pdo/.env`（仅 `pdo` 自动加载）
@@ -176,15 +184,15 @@ macOS 使用系统 AppKit 剪贴板，Windows 使用 PowerShell/.NET。Linux Way
 
 pdo 按配置顺序处理字面 `Host` 别名，忽略通配符和否定模式并去重。根配置以及每个 Include 文件全局区域中的 `Include` 会递归展开；支持 `~/`、相对 `~/.ssh` 的路径和 glob，但不支持 Include 中的环境变量或 OpenSSH token。条件块中的 Include 不用于枚举 Host。
 
-开始复制前，pdo 会通过 `ssh -G` 验证所有 Host 的 OpenSSH 配置；验证全部通过后，macOS 和 Linux 依次执行 `ssh-copy-id -i <identity> -F <config> <host>`，Windows 则通过 `ssh` 将公钥写入远端 `~/.ssh/authorized_keys`。Windows 会按公钥主体查重，即使注释不同也不会重复写入。密码、私钥口令和 host-key 确认直接使用当前终端。某个 Host 失败不会阻止后续 Host，最终有任一失败时退出 `1`。
+开始复制前，pdo 会通过 `ssh -G` 验证所有 Host 的 OpenSSH 配置；验证全部通过后，Unix 在 `ssh-copy-id` 可用时优先调用它，否则和 Windows 一样通过 `ssh` 将公钥写入远端 `~/.ssh/authorized_keys`。内置写入会按公钥主体查重，即使注释不同也不会重复写入。密码、私钥口令和 host-key 确认直接使用当前终端。某个 Host 失败不会阻止后续 Host，最终有任一失败时退出 `1`。
 
-所有平台都要求 `ssh` 可从 `PATH` 找到；macOS 和 Linux 还需要 `ssh-copy-id`。Windows 只需启用系统的 OpenSSH Client。
+所有平台都要求 OpenSSH Client 可从 `PATH` 找到；`ssh-copy-id` 是可选项。
 
 ## 更新
 
 pdo 每 24 小时在命令启动时检查一次最新稳定 Release，并使用 `~/.config/pdo/.update-check` 记录检查时间。发现新版本时，交互终端可以输入 `y` 或 `yes` 立即升级，也可以直接回车忽略并继续执行当前命令；管道或重定向场景只提示运行 `pdo update`，不会读取标准输入。升级完成后请重新执行原命令。
 
-`pdo update --check` 只检查 GitHub 上的最新稳定 Release，不写入本地文件。`pdo update` 会校验同一 Release 中的 `SHA256SUMS`、验证候选二进制版本，然后替换当前实际执行文件。
+`pdo update --check` 只检查 GitHub 上的最新稳定 Release，不写入本地文件。`pdo update` 会校验同一 Release 中的 `SHA256SUMS`、验证候选二进制版本并检查其依赖，然后替换当前实际执行文件；依赖安装失败或被拒绝不会替换现有版本。
 
 普通 `go build` 生成的开发版本显示为 `pdo devel`，并拒绝执行更新。
 
@@ -213,4 +221,4 @@ go test ./...
 go build .
 ```
 
-推送 `v*` tag 会注入 tag 作为版本号，并在测试通过后发布 macOS、Linux、Windows 的 `amd64` / `arm64` 二进制、安装与卸载脚本及 `SHA256SUMS`。
+CI 在 macOS、Linux、Windows 上运行测试，并使用官方 OpenWrt stable rootfs 验证 BusyBox `wget` 安装及启动流程。推送 `v*` tag 会注入 tag 作为版本号，并在完整兼容性测试通过后发布 macOS、Linux、Windows 的 `amd64` / `arm64` 二进制、安装与卸载脚本及 `SHA256SUMS`。
