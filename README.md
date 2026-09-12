@@ -22,9 +22,11 @@ Windows PowerShell：
 irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
 ```
 
-安装器会识别 `amd64` / `arm64`、验证 SHA-256，并在替换二进制前检查依赖。Linux 支持 `apt-get`、`dnf`、`yum`、`pacman`、`apk`、`zypper`，OpenWrt 支持 `opkg` 和新版 `apk`；缺少依赖时会显示安装命令并在交互终端询问是否安装，非交互安装会显示命令后退出。非 root 用户使用 `sudo`，OpenWrt 的 Dropbear 客户端会保留，并安装 OpenSSH 客户端供 pdo 使用。macOS 缺失系统组件时应修复系统组件，安装器不会安装 Homebrew。
+安装器会识别 `amd64` / `arm64` 并验证 SHA-256。下载器、SHA-256 工具和 `awk` 是安装器硬依赖；Linux 缺少时会显示安装命令并在交互终端询问是否安装，拒绝、失败或非交互执行会停止安装。Linux 支持 `apt-get`、`dnf`、`yum`、`pacman`、`apk`、`zypper`，OpenWrt 支持 `opkg` 和新版 `apk`，非 root 用户使用 `sudo`。
 
-依赖满足后，安装器会询问是否立即运行 `pdo setup`。选择否（或没有交互终端）时，仅在配置不存在时创建模板。Windows 安装器会将安装目录加入用户 PATH（当前 PowerShell 立即可用）；macOS / Linux / OpenWrt 不修改 PATH，也不会覆盖已有配置。
+OpenSSH 和系统剪贴板组件是功能级可选依赖。缺失时安装器会说明受影响功能和安装命令，但仍完成 pdo 安装；OpenWrt 默认 Dropbear 可以保留，只有使用 `copy-ssh-id` 时才需要 OpenSSH Client。macOS 或 Windows 缺少系统剪贴板组件时应修复系统组件，安装器不会安装第三方替代品。
+
+安装器硬依赖满足后，安装器会询问是否立即运行 `pdo setup`。选择否（或没有交互终端）时，仅在配置不存在时创建模板。Windows 安装器会将安装目录加入用户 PATH（当前 PowerShell 立即可用）；macOS / Linux / OpenWrt 不修改 PATH，也不会覆盖已有配置。
 
 - macOS / Linux / OpenWrt：`~/.local/bin/pdo`
 - Windows：`%LOCALAPPDATA%\Programs\pdo\pdo.exe`
@@ -168,6 +170,8 @@ pdo --help
 
 macOS 使用系统 AppKit 剪贴板，Windows 使用 PowerShell/.NET。Linux Wayland 需要 `wl-clipboard`（`sudo apt install wl-clipboard`、`sudo dnf install wl-clipboard` 或 `sudo pacman -S wl-clipboard`），X11 需要 `xclip`（`sudo apt install xclip`、`sudo dnf install xclip` 或 `sudo pacman -S xclip`）。没有 Wayland/X11 图形会话或剪贴板写入失败时，`pdo paste` 会提示原因并仍将文本或图片摘要输出到终端；剪贴板同时含图片和文本时优先使用图片。
 
+只有无参数且没有管道输入的 `pdo copy` 会检查剪贴板读取依赖，并在交互终端询问是否安装；带参数或管道的 `copy` 不检查本地剪贴板。`paste` 不弹出安装确认，剪贴板不可用时保持成功并降级输出终端。
+
 `pdo copy` 带文本参数时优先使用参数；无参数且标准输入来自管道或文件重定向时，将输入原样作为 UTF-8 文本上传；交互终端中无参数时读取系统剪贴板。
 
 批量同步按配置名称排序执行；指定多个选择器时按参数顺序执行。某项失败不会阻止后续项目，最终只要有一项失败，命令就返回退出码 `1`。
@@ -186,13 +190,13 @@ pdo 按配置顺序处理字面 `Host` 别名，忽略通配符和否定模式�
 
 开始复制前，pdo 会通过 `ssh -G` 验证所有 Host 的 OpenSSH 配置；验证全部通过后，Unix 在 `ssh-copy-id` 可用时优先调用它，否则和 Windows 一样通过 `ssh` 将公钥写入远端 `~/.ssh/authorized_keys`。内置写入会按公钥主体查重，即使注释不同也不会重复写入。密码、私钥口令和 host-key 确认直接使用当前终端。某个 Host 失败不会阻止后续 Host，最终有任一失败时退出 `1`。
 
-所有平台都要求 OpenSSH Client 可从 `PATH` 找到；`ssh-copy-id` 是可选项。
+OpenSSH Client 只在执行 `copy-ssh-id` 时需要。缺失时，交互终端会询问是否安装并在成功后继续原命令；无法安装或提权只会让本次 `copy-ssh-id` 失败。`ssh-copy-id` 是可选项。
 
 ## 更新
 
 pdo 每 24 小时在命令启动时检查一次最新稳定 Release，并使用 `~/.config/pdo/.update-check` 记录检查时间。发现新版本时，交互终端可以输入 `y` 或 `yes` 立即升级，也可以直接回车忽略并继续执行当前命令；管道或重定向场景只提示运行 `pdo update`，不会读取标准输入。升级完成后请重新执行原命令。
 
-`pdo update --check` 只检查 GitHub 上的最新稳定 Release，不写入本地文件。`pdo update` 会校验同一 Release 中的 `SHA256SUMS`、验证候选二进制版本并检查其依赖，然后替换当前实际执行文件；依赖安装失败或被拒绝不会替换现有版本。
+`pdo update --check` 只检查 GitHub 上的最新稳定 Release，不写入本地文件。`pdo update` 会校验同一 Release 中的 `SHA256SUMS`、验证候选二进制版本，然后更新二进制并迁移配置和必要数据。缺少功能级可选依赖时只显示警告，不阻止更新；校验、写入或迁移失败仍会保留旧版本。
 
 普通 `go build` 生成的开发版本显示为 `pdo devel`，并拒绝执行更新。
 

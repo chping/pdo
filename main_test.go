@@ -394,8 +394,15 @@ func TestCloudClipboardTextAndImageCommands(t *testing.T) {
 	writeCloudConfig(t, home, fixture.server.URL)
 	setCloudServer(t, fixture.server)
 
-	previousRead, previousWrite := readClipboard, writeClipboard
-	t.Cleanup(func() { readClipboard, writeClipboard = previousRead, previousWrite })
+	previousRead, previousWrite, previousDependencies := readClipboard, writeClipboard, checkDependencies
+	t.Cleanup(func() {
+		readClipboard, writeClipboard, checkDependencies = previousRead, previousWrite, previousDependencies
+	})
+	dependencyChecks := []dependencyFeature{}
+	checkDependencies = func(feature dependencyFeature, _ io.Reader, _, _ bool, _, _ io.Writer) error {
+		dependencyChecks = append(dependencyChecks, feature)
+		return nil
+	}
 	var writtenKind string
 	var writtenData []byte
 	recordClipboardWrite := func(kind string, data []byte) error {
@@ -409,6 +416,9 @@ func TestCloudClipboardTextAndImageCommands(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"copy", text}, &stdout, &stderr); code != 0 || stdout.Len() != 0 || stderr.Len() != 0 {
 		t.Fatalf("copy code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if len(dependencyChecks) != 0 {
+		t.Fatalf("explicit copy checked dependencies: %v", dependencyChecks)
 	}
 	if code := run([]string{"paste"}, &stdout, &stderr); code != 0 || stdout.String() != text || writtenKind != "text" || string(writtenData) != text {
 		t.Fatalf("paste code=%d stdout=%q stderr=%q kind=%q data=%q", code, stdout.String(), stderr.String(), writtenKind, writtenData)
@@ -477,6 +487,9 @@ func TestCloudClipboardTextAndImageCommands(t *testing.T) {
 	readClipboard = func() (string, []byte, error) { return "image-png", imageData.Bytes(), nil }
 	if code := run([]string{"copy"}, &stdout, &stderr); code != 0 || stdout.Len() != 0 || stderr.Len() != 0 {
 		t.Fatalf("image copy code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if len(dependencyChecks) != 1 || dependencyChecks[0] != dependencyClipboard {
+		t.Fatalf("clipboard dependency checks=%v", dependencyChecks)
 	}
 	if code := run([]string{"paste"}, &stdout, &stderr); code != 0 || stdout.String() != fmt.Sprintf("image/png 2x3 %d bytes\n", imageData.Len()) || writtenKind != "image-png" || !bytes.Equal(writtenData, imageData.Bytes()) {
 		t.Fatalf("image paste code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
@@ -1067,8 +1080,15 @@ func TestRunCopySSHIDPreflightsThenContinues(t *testing.T) {
 	writeTestFile(t, filepath.Join(sshDir, "id_test"), "private")
 	writeTestFile(t, filepath.Join(sshDir, "id_test.pub"), "public")
 
-	previousFind, previousRun, previousGOOS := findCommand, runCommand, copySSHIDGOOS
-	t.Cleanup(func() { findCommand, runCommand, copySSHIDGOOS = previousFind, previousRun, previousGOOS })
+	previousFind, previousRun, previousGOOS, previousDependencies := findCommand, runCommand, copySSHIDGOOS, checkDependencies
+	t.Cleanup(func() {
+		findCommand, runCommand, copySSHIDGOOS, checkDependencies = previousFind, previousRun, previousGOOS, previousDependencies
+	})
+	dependencyChecks := []dependencyFeature{}
+	checkDependencies = func(feature dependencyFeature, _ io.Reader, _, _ bool, _, _ io.Writer) error {
+		dependencyChecks = append(dependencyChecks, feature)
+		return nil
+	}
 	copySSHIDGOOS = "linux"
 	findCommand = func(name string) (string, error) { return "/mock/" + name, nil }
 	type call struct {
@@ -1097,6 +1117,9 @@ func TestRunCopySSHIDPreflightsThenContinues(t *testing.T) {
 	if len(calls) != 4 || calls[0].name != "/mock/ssh" || calls[1].name != "/mock/ssh" || calls[2].name != "/mock/ssh-copy-id" || calls[3].name != "/mock/ssh-copy-id" {
 		t.Fatalf("calls=%+v", calls)
 	}
+	if len(dependencyChecks) != 1 || dependencyChecks[0] != dependencySSH {
+		t.Fatalf("dependency checks=%v", dependencyChecks)
+	}
 	identity := filepath.Join(sshDir, "id_test")
 	config := filepath.Join(sshDir, "config")
 	if strings.Join(calls[2].args, "|") != strings.Join([]string{"-i", identity, "-F", config, "Alpha"}, "|") {
@@ -1105,6 +1128,7 @@ func TestRunCopySSHIDPreflightsThenContinues(t *testing.T) {
 }
 
 func TestRunCopySSHIDTargetHost(t *testing.T) {
+	bypassDependencyChecks(t)
 	home := t.TempDir()
 	setHome(t, home)
 	sshDir := filepath.Join(home, ".ssh")
@@ -1153,6 +1177,7 @@ func TestRunCopySSHIDTargetHost(t *testing.T) {
 }
 
 func TestRunCopySSHIDDirectFallbackUsesSSH(t *testing.T) {
+	bypassDependencyChecks(t)
 	home := t.TempDir()
 	setHome(t, home)
 	sshDir := filepath.Join(home, ".ssh")
@@ -1227,6 +1252,7 @@ func TestDirectSSHCopyIDCommandAvoidsDuplicateKey(t *testing.T) {
 }
 
 func TestRunCopySSHIDPreflightFailurePreventsCopies(t *testing.T) {
+	bypassDependencyChecks(t)
 	home := t.TempDir()
 	setHome(t, home)
 	sshDir := filepath.Join(home, ".ssh")
@@ -1262,6 +1288,7 @@ func TestRunCopySSHIDPreflightFailurePreventsCopies(t *testing.T) {
 }
 
 func TestCopySSHIDRequiresToolsAndLiteralHosts(t *testing.T) {
+	bypassDependencyChecks(t)
 	home := t.TempDir()
 	setHome(t, home)
 	sshDir := filepath.Join(home, ".ssh")
@@ -1329,7 +1356,7 @@ func TestDependencyPlans(t *testing.T) {
 				}
 				return "", errors.New("missing")
 			}
-			_, commands, err := dependencyPlan(test.goos, test.openWrt, true)
+			_, commands, err := dependencyPlan(test.goos, test.openWrt, true, dependencyAll)
 			if test.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 					t.Fatalf("error=%v", err)
@@ -1363,6 +1390,51 @@ func TestLinuxDependencyPackageNames(t *testing.T) {
 		if len(packages) != 1 || packages[0] != test.want {
 			t.Fatalf("manager=%s packages=%v", test.manager, packages)
 		}
+	}
+}
+
+func TestOptionalDependencyWarningsDoNotFail(t *testing.T) {
+	previousFind, previousRun := findCommand, runCommand
+	t.Cleanup(func() { findCommand, runCommand = previousFind, previousRun })
+	findCommand = func(name string) (string, error) {
+		if (runtime.GOOS == "linux" && name == "apt-get") || (runtime.GOOS == "windows" && name == "powershell.exe") {
+			return name, nil
+		}
+		return "", errors.New("missing")
+	}
+	runCommand = func(string, []string, io.Reader, io.Writer, io.Writer) error {
+		t.Fatal("warning-only check ran an install command")
+		return nil
+	}
+	var stderr bytes.Buffer
+	if err := ensureDependencies(dependencySSH, nil, false, false, io.Discard, &stderr); err != nil || !strings.Contains(stderr.String(), "copy-ssh-id") {
+		t.Fatalf("error=%v stderr=%q", err, stderr.String())
+	}
+}
+
+func TestFeatureDependencyInstallContinuesCommand(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux package manager behavior")
+	}
+	previousFind, previousRun := findCommand, runCommand
+	t.Cleanup(func() { findCommand, runCommand = previousFind, previousRun })
+	installed := false
+	findCommand = func(name string) (string, error) {
+		if name == "apt-get" || name == "sudo" || (name == "ssh" && installed) {
+			return name, nil
+		}
+		return "", errors.New("missing")
+	}
+	runCommand = func(_ string, args []string, _ io.Reader, stdout, _ io.Writer) error {
+		if len(args) == 1 && args[0] == "-V" {
+			fmt.Fprint(stdout, "OpenSSH_9.0")
+		} else if strings.Contains(strings.Join(args, " "), "openssh-client") {
+			installed = true
+		}
+		return nil
+	}
+	if err := ensureDependencies(dependencySSH, strings.NewReader("yes\n"), true, true, io.Discard, io.Discard); err != nil || !installed {
+		t.Fatalf("installed=%v error=%v", installed, err)
 	}
 }
 
@@ -1434,6 +1506,25 @@ func TestUpdateCheckIsReadOnly(t *testing.T) {
 				t.Fatalf("--check wrote to home: %v", err)
 			}
 		})
+	}
+}
+
+func TestInternalMigrationIgnoresOptionalDependencies(t *testing.T) {
+	home := t.TempDir()
+	tx, err := startTransaction(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { tx.cleanup() })
+	previous := checkDependencies
+	checkDependencies = func(dependencyFeature, io.Reader, bool, bool, io.Writer, io.Writer) error {
+		t.Fatal("migration checked optional dependencies")
+		return nil
+	}
+	t.Cleanup(func() { checkDependencies = previous })
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"__pdo-migrate", home, tx.dir}, &stdout, &stderr); code != 0 || stdout.String() != "0\n" {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 }
 
@@ -2263,6 +2354,13 @@ func runSetupForTest(t *testing.T, inputText string, secrets ...string) (*bytes.
 	})
 	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
 	return stdout, stderr, run([]string{"setup"}, stdout, stderr)
+}
+
+func bypassDependencyChecks(t *testing.T) {
+	t.Helper()
+	previous := checkDependencies
+	checkDependencies = func(dependencyFeature, io.Reader, bool, bool, io.Writer, io.Writer) error { return nil }
+	t.Cleanup(func() { checkDependencies = previous })
 }
 
 func writeConfig(t *testing.T, home string, dotfiles map[string]dotfileConfig) {

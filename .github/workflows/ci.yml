@@ -58,16 +58,16 @@ jobs:
           curl -fsS http://127.0.0.1:18080/SHA256SUMS >/dev/null
           docker run --rm --network host -v "$PWD/.openwrt-assets:/assets:ro" openwrt/rootfs:x86_64-24.10.8 sh -ec '
             mkdir -p /var/lock
-            if /assets/pdo_linux_amd64 __pdo-dependencies >/tmp/dependencies 2>&1; then
-              echo "dependency check unexpectedly accepted Dropbear" >&2
+            /assets/pdo_linux_amd64 __pdo-dependencies >/tmp/dependencies 2>&1
+            grep -q "opkg install openssh-client" /tmp/dependencies
+            opkg list-installed | grep -q "^dropbear "
+            if opkg list-installed | grep -q "^openssh-client "; then
+              echo "OpenSSH client was unexpectedly installed" >&2
               exit 1
             fi
-            grep -q "opkg install openssh-client" /tmp/dependencies
-            opkg update
-            opkg install openssh-client
-            opkg list-installed | grep -q "^dropbear "
             wget -qO- http://127.0.0.1:18080/install.sh | sh
             /root/.local/bin/pdo version | grep -q "pdo devel"
+            if opkg list-installed | grep -q "^openssh-client "; then exit 1; fi
           '
 
   release:

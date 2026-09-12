@@ -75,9 +75,10 @@ var (
 		command.Stderr = stderr
 		return command.Run()
 	}
-	readClipboard   = systemClipboardRead
-	writeClipboard  = systemClipboardWrite
-	cloudHTTPClient = func() *http.Client {
+	readClipboard     = systemClipboardRead
+	writeClipboard    = systemClipboardWrite
+	checkDependencies = ensureDependencies
+	cloudHTTPClient   = func() *http.Client {
 		return &http.Client{Timeout: 10 * time.Minute}
 	}
 	setupInput      = os.Stdin
@@ -225,6 +226,14 @@ type dependencyCommand struct {
 	display string
 }
 
+type dependencyFeature uint8
+
+const (
+	dependencyAll dependencyFeature = iota
+	dependencySSH
+	dependencyClipboard
+)
+
 func main() {
 	args := os.Args[1:]
 	if !(len(args) == 2 && args[0] == "update" && args[1] == "--check") {
@@ -244,17 +253,13 @@ func main() {
 
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 1 && args[0] == "__pdo-dependencies" {
-		if err := ensureDependencies(os.Stdin, isSetupTerminal(os.Stdin), true, stdout, stderr); err != nil {
+		if err := checkDependencies(dependencyAll, os.Stdin, false, false, stdout, stderr); err != nil {
 			fmt.Fprintf(stderr, "pdo: dependencies: %v\n", err)
 			return 1
 		}
 		return 0
 	}
 	if len(args) == 3 && args[0] == "__pdo-migrate" {
-		if err := ensureDependencies(nil, false, false, stdout, stderr); err != nil {
-			fmt.Fprintf(stderr, "pdo: migrate: dependencies: %v\n", err)
-			return 1
-		}
 		count, err := runInternalMigrations(args[1], args[2])
 		if err != nil {
 			fmt.Fprintf(stderr, "pdo: migrate: %v\n", err)
@@ -460,6 +465,10 @@ func runCloudClipboard(args []string, stdin io.Reader, stdout, stderr io.Writer)
 					return fmt.Errorf("read standard input: %w", err)
 				}
 			} else {
+				input, _ := stdin.(*os.File)
+				if err := checkDependencies(dependencyClipboard, stdin, input != nil && isSetupTerminal(input), true, stdout, stderr); err != nil {
+					return err
+				}
 				kind, data, err = readClipboard()
 				if err != nil {
 					return err
@@ -1007,6 +1016,9 @@ func linuxClipboardRead() (string, []byte, error) {
 		}
 		return "", nil, fmt.Errorf("system clipboard does not contain text or an image")
 	}
+	if os.Getenv("DISPLAY") == "" {
+		return "", nil, fmt.Errorf("no graphical clipboard session (DISPLAY and WAYLAND_DISPLAY are unset); start a Wayland or X11 session")
+	}
 
 	command, err := findCommand("xclip")
 	if err != nil {
@@ -1073,7 +1085,7 @@ func linuxClipboardInstallCommand(packageName string) string {
 func macOSClipboardRead() (string, []byte, error) {
 	command, err := findCommand("osascript")
 	if err != nil {
-		return "", nil, fmt.Errorf("osascript is required")
+		return "", nil, fmt.Errorf("osascript is required; repair macOS system components")
 	}
 	kindOutput, err := clipboardCommandOutput(command, []string{"-l", "JavaScript", "-e", macOSClipboardTypeScript}, nil)
 	if err != nil {
@@ -1095,7 +1107,7 @@ func macOSClipboardRead() (string, []byte, error) {
 func macOSClipboardWrite(kind string, data []byte) error {
 	command, err := findCommand("osascript")
 	if err != nil {
-		return fmt.Errorf("osascript is required")
+		return fmt.Errorf("osascript is required; repair macOS system components")
 	}
 	script := macOSClipboardWriteTextScript
 	if kind == "image-png" {
@@ -1108,7 +1120,7 @@ func macOSClipboardWrite(kind string, data []byte) error {
 func windowsClipboardRead() (string, []byte, error) {
 	command, err := findCommand("powershell.exe")
 	if err != nil {
-		return "", nil, fmt.Errorf("PowerShell is required")
+		return "", nil, fmt.Errorf("PowerShell is required; repair it in Windows optional features")
 	}
 	temporary, err := os.CreateTemp("", "pdo-clipboard-*")
 	if err != nil {
@@ -1138,7 +1150,7 @@ func windowsClipboardRead() (string, []byte, error) {
 func windowsClipboardWrite(kind string, data []byte) error {
 	command, err := findCommand("powershell.exe")
 	if err != nil {
-		return fmt.Errorf("PowerShell is required")
+		return fmt.Errorf("PowerShell is required; repair it in Windows optional features")
 	}
 	temporary, err := os.CreateTemp("", "pdo-clipboard-*")
 	if err != nil {
@@ -1373,6 +1385,9 @@ func copySSHID(options copySSHIDOptions, stdout, stderr io.Writer) (bool, error)
 			return false, fmt.Errorf("target Host %q was not found in %s", options.targetHost, options.config)
 		}
 		hosts = []string{selected}
+	}
+	if err := checkDependencies(dependencySSH, os.Stdin, isSetupTerminal(os.Stdin), true, stdout, stderr); err != nil {
+		return false, err
 	}
 	ssh, err := findCommand("ssh")
 	if err != nil {
@@ -2532,26 +2547,32 @@ func linuxDependencyCommands(manager string, packages []string, root bool) ([]de
 	return commands, nil
 }
 
-func dependencyPlan(goos string, openWrt, root bool) ([]string, []dependencyCommand, error) {
+func dependencyPlan(goos string, openWrt, root bool, feature dependencyFeature) ([]string, []dependencyCommand, error) {
 	missing := []string{}
-	needSSH := !openSSHAvailable()
+	checkSSH := feature == dependencyAll || feature == dependencySSH
+	checkClipboard := feature == dependencyAll || feature == dependencyClipboard
+	needSSH := checkSSH && !openSSHAvailable()
 	if needSSH {
-		missing = append(missing, "OpenSSH client")
+		missing = append(missing, "OpenSSH client (copy-ssh-id)")
 	}
 	switch goos {
 	case "darwin":
-		if !commandAvailable("osascript") {
-			missing = append(missing, "osascript")
+		if checkClipboard && !commandAvailable("osascript") {
+			missing = append(missing, "osascript (system clipboard)")
 		}
 		if len(missing) != 0 {
-			return missing, nil, fmt.Errorf("required macOS system components are missing; repair or reinstall macOS Command Line Tools")
+			return missing, nil, fmt.Errorf("required macOS system components are missing; repair macOS system components")
 		}
 	case "windows":
-		if !commandAvailable("powershell.exe") {
-			missing = append(missing, "Windows PowerShell")
+		powershellAvailable := commandAvailable("powershell.exe")
+		if checkClipboard && !powershellAvailable {
+			missing = append(missing, "Windows PowerShell (system clipboard)")
 			return missing, nil, fmt.Errorf("Windows PowerShell is missing; repair it in Windows optional features")
 		}
 		if needSSH {
+			if !powershellAvailable {
+				return missing, nil, fmt.Errorf("Windows PowerShell is required to install OpenSSH Client; repair it in Windows optional features")
+			}
 			return missing, []dependencyCommand{{
 				name:    "powershell.exe",
 				args:    []string{"-NoProfile", "-NonInteractive", "-Command", windowsOpenSSHInstallScript},
@@ -2559,12 +2580,17 @@ func dependencyPlan(goos string, openWrt, root bool) ([]string, []dependencyComm
 			}}, nil
 		}
 	case "linux":
-		needWayland := !openWrt && os.Getenv("WAYLAND_DISPLAY") != "" && (!commandAvailable("wl-copy") || !commandAvailable("wl-paste"))
-		needX11 := !openWrt && !needWayland && os.Getenv("WAYLAND_DISPLAY") == "" && os.Getenv("DISPLAY") != "" && !commandAvailable("xclip")
+		wayland := os.Getenv("WAYLAND_DISPLAY") != ""
+		x11 := os.Getenv("DISPLAY") != ""
+		needWayland := checkClipboard && !openWrt && wayland && (!commandAvailable("wl-copy") || !commandAvailable("wl-paste"))
+		needX11 := checkClipboard && !openWrt && !wayland && x11 && !commandAvailable("xclip")
 		if needWayland {
-			missing = append(missing, "wl-clipboard")
+			missing = append(missing, "wl-clipboard (system clipboard)")
 		} else if needX11 {
-			missing = append(missing, "xclip")
+			missing = append(missing, "xclip (system clipboard)")
+		} else if feature == dependencyClipboard && (openWrt || (!wayland && !x11)) {
+			missing = append(missing, "graphical clipboard session")
+			return missing, nil, fmt.Errorf("no graphical clipboard session is available")
 		}
 		if len(missing) != 0 {
 			manager := linuxPackageManager(openWrt)
@@ -2580,25 +2606,31 @@ func dependencyPlan(goos string, openWrt, root bool) ([]string, []dependencyComm
 	return missing, nil, nil
 }
 
-func ensureDependencies(stdin io.Reader, interactive, install bool, stdout, stderr io.Writer) error {
-	missing, commands, planErr := dependencyPlan(runtime.GOOS, openWrtHost(), rootUser())
+func ensureDependencies(feature dependencyFeature, stdin io.Reader, interactive, install bool, stdout, stderr io.Writer) error {
+	missing, commands, planErr := dependencyPlan(runtime.GOOS, openWrtHost(), rootUser(), feature)
 	if len(missing) == 0 {
 		return nil
 	}
-	fmt.Fprintf(stderr, "pdo: missing dependencies: %s\n", strings.Join(missing, ", "))
+	fmt.Fprintf(stderr, "pdo: missing optional dependencies: %s\n", strings.Join(missing, ", "))
 	if len(commands) != 0 {
 		fmt.Fprintln(stderr, "pdo: install with:")
 		for _, command := range commands {
 			fmt.Fprintf(stderr, "  %s\n", command.display)
 		}
 	}
+	if !install {
+		if planErr != nil {
+			fmt.Fprintf(stderr, "pdo: dependency note: %v\n", planErr)
+		}
+		return nil
+	}
 	if planErr != nil {
 		return planErr
 	}
-	if !install || !interactive {
+	if !interactive {
 		return fmt.Errorf("install the missing dependencies and retry")
 	}
-	fmt.Fprint(stderr, "Install missing dependencies now? [y/N] ")
+	fmt.Fprint(stderr, "Install missing optional dependencies now? [y/N] ")
 	answer, _ := bufio.NewReader(stdin).ReadString('\n')
 	answer = strings.TrimSpace(answer)
 	if !strings.EqualFold(answer, "y") && !strings.EqualFold(answer, "yes") {
@@ -2609,7 +2641,7 @@ func ensureDependencies(stdin io.Reader, interactive, install bool, stdout, stde
 			return fmt.Errorf("run %s: %w", command.display, err)
 		}
 	}
-	missing, _, err := dependencyPlan(runtime.GOOS, openWrtHost(), rootUser())
+	missing, _, err := dependencyPlan(runtime.GOOS, openWrtHost(), rootUser(), feature)
 	if err != nil || len(missing) != 0 {
 		return fmt.Errorf("dependencies are still missing after installation")
 	}
