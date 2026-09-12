@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -138,6 +141,112 @@ func TestRunUsageSelectorsAndExitCodes(t *testing.T) {
 	stderr.Reset()
 	if code := run([]string{"download", "dotfiles", "--ssh-config", "--ssh-config"}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "1 succeeded, 0 failed") {
 		t.Fatalf("duplicate: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestVersionCommandsAndUpdateUsage(t *testing.T) {
+	previous := version
+	version = "v0.1.0"
+	t.Cleanup(func() { version = previous })
+
+	for _, args := range [][]string{{"version"}, {"--version"}} {
+		var stdout, stderr bytes.Buffer
+		if code := run(args, &stdout, &stderr); code != 0 || stdout.String() != "pdo v0.1.0\n" || stderr.Len() != 0 {
+			t.Fatalf("args=%v code=%d stdout=%q stderr=%q", args, code, stdout.String(), stderr.String())
+		}
+	}
+	for _, args := range [][]string{{"version", "extra"}, {"update", "--unknown"}, {"update", "--check", "extra"}} {
+		var stdout, stderr bytes.Buffer
+		if code := run(args, &stdout, &stderr); code != 2 {
+			t.Fatalf("args=%v code=%d", args, code)
+		}
+	}
+	version = "devel"
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"update", "--check"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "development builds") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestVersionParsing(t *testing.T) {
+	valid := []string{"v0.1.0", "v1.20.300"}
+	for _, value := range valid {
+		if _, err := parseVersion(value); err != nil {
+			t.Errorf("parseVersion(%q): %v", value, err)
+		}
+	}
+	invalid := []string{"0.1.0", "v01.0.0", "v1.0", "v1.0.0-rc.1", "v1.0.0+meta", "devel"}
+	for _, value := range invalid {
+		if _, err := parseVersion(value); err == nil {
+			t.Errorf("parseVersion(%q) succeeded", value)
+		}
+	}
+}
+
+func TestUpdateCheckIsReadOnly(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		current string
+		latest  string
+		want    string
+	}{
+		{name: "available", current: "v0.1.0", latest: "v0.1.1", want: "Update available: v0.1.0 -> v0.1.1\n"},
+		{name: "current", current: "v0.1.0", latest: "v0.1.0", want: "pdo v0.1.0 is up to date\n"},
+		{name: "no downgrade", current: "v0.2.0", latest: "v0.1.0", want: "pdo v0.2.0 is up to date\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(release{TagName: test.latest})
+			}))
+			defer server.Close()
+			home := t.TempDir()
+			u := updater{http: server.Client(), apiBase: server.URL, version: test.current, home: home}
+			var output bytes.Buffer
+			if err := u.run(true, &output); err != nil {
+				t.Fatal(err)
+			}
+			if output.String() != test.want {
+				t.Fatalf("output=%q want=%q", output.String(), test.want)
+			}
+			if _, err := os.Stat(filepath.Join(home, ".config")); !os.IsNotExist(err) {
+				t.Fatalf("--check wrote to home: %v", err)
+			}
+		})
+	}
+}
+
+func TestUpdateRejectsBadLatestRelease(t *testing.T) {
+	for _, found := range []release{
+		{TagName: "v0.1.1-rc.1"},
+		{TagName: "v0.1.1", Prerelease: true},
+		{TagName: "v0.1.1", Draft: true},
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode(found)
+		}))
+		u := updater{http: server.Client(), apiBase: server.URL, version: "v0.1.0"}
+		if err := u.run(true, io.Discard); err == nil {
+			t.Fatalf("release %+v accepted", found)
+		}
+		server.Close()
+	}
+}
+
+func TestUpdateErrors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	u := updater{http: server.Client(), apiBase: server.URL, version: "v0.1.0"}
+	if err := u.run(true, io.Discard); err == nil || !strings.Contains(err.Error(), "HTTP 500") {
+		t.Fatalf("network error=%v", err)
+	}
+	if _, err := updateAssetName("freebsd", "amd64"); err == nil {
+		t.Fatal("unsupported platform accepted")
+	}
+	u = updater{goos: runtime.GOOS, goarch: runtime.GOARCH}
+	if err := u.install(release{TagName: "v0.1.1"}, io.Discard); err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("missing asset error=%v", err)
 	}
 }
 
@@ -406,6 +515,353 @@ func TestGitHubRequestAndTokenRedaction(t *testing.T) {
 	_, _, _, err := testClient(t, server).get()
 	if err == nil || strings.Contains(err.Error(), "token-for-test") || !strings.Contains(err.Error(), "[redacted]") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestMigrationPreservesUnknownFieldsSymlinkModeAndRollsBack(t *testing.T) {
+	home := t.TempDir()
+	configDir := filepath.Join(home, ".config", "pdo")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "actual-config.json")
+	original := []byte("{\"schema_version\":1,\"future\":{\"keep\":true}}\n")
+	if err := os.WriteFile(target, original, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(configDir, "config.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	tx, err := startTransaction(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps := map[int]jsonMigration{
+		1: func(document map[string]json.RawMessage) error {
+			document["added"] = json.RawMessage(`"one"`)
+			return nil
+		},
+		2: func(document map[string]json.RawMessage) error {
+			document["added"] = json.RawMessage(`"two"`)
+			return nil
+		},
+	}
+	changed, err := migrateJSONFile(link, 3, steps, tx)
+	if err != nil || !changed {
+		t.Fatalf("changed=%v error=%v", changed, err)
+	}
+	var migrated map[string]json.RawMessage
+	data, _ := os.ReadFile(target)
+	if err := json.Unmarshal(data, &migrated); err != nil {
+		t.Fatal(err)
+	}
+	var future struct {
+		Keep bool `json:"keep"`
+	}
+	if err := json.Unmarshal(migrated["future"], &future); err != nil {
+		t.Fatal(err)
+	}
+	if string(migrated["schema_version"]) != "3" || string(migrated["added"]) != `"two"` || !future.Keep {
+		t.Fatalf("migrated=%s", data)
+	}
+	if runtime.GOOS != "windows" {
+		assertMode(t, target, 0o640)
+		assertMode(t, filepath.Join(tx.dir, "file-0"), 0o600)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("link changed: info=%v error=%v", info, err)
+	}
+	if err := tx.rollback(); err != nil {
+		t.Fatal(err)
+	}
+	assertFileContent(t, target, original)
+	if err := tx.cleanup(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMigrationRestoresMissingFileAndRequiresContinuousChain(t *testing.T) {
+	home := t.TempDir()
+	tx, err := startTransaction(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, ".config", "pdo", "data.json")
+	if err := tx.backup(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicWriteFile(path, []byte("new\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("new file was not removed: %v", err)
+	}
+	if err := tx.cleanup(); err != nil {
+		t.Fatal(err)
+	}
+
+	configPath := filepath.Join(home, ".config", "pdo", "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"schema_version":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tx, err = startTransaction(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrateJSONFile(configPath, 3, map[int]jsonMigration{1: func(map[string]json.RawMessage) error { return nil }}, tx); err == nil || !strings.Contains(err.Error(), "missing migration") {
+		t.Fatalf("error=%v", err)
+	}
+	if len(tx.manifest.Files) != 0 {
+		t.Fatalf("files were backed up before chain validation: %+v", tx.manifest.Files)
+	}
+	tx.cleanup()
+}
+
+func TestRollbackRestoresMigrationAndExecutable(t *testing.T) {
+	home := t.TempDir()
+	tx, err := startTransaction(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(home, ".config", "pdo", "config.json")
+	if err := os.WriteFile(configPath, []byte("old config"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.backup(configPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicWriteFile(configPath, []byte("new config"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executable := filepath.Join(home, "pdo")
+	backup := executable + ".pdo-update-old"
+	if err := os.WriteFile(executable, []byte("new binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backup, []byte("old binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cause := fmt.Errorf("injected failure")
+	if err := rollbackUpdate(tx, executable, backup, runtime.GOOS, cause); err == nil || err.Error() != cause.Error() {
+		t.Fatalf("rollback error=%v", err)
+	}
+	assertFileContent(t, configPath, []byte("old config"))
+	assertFileContent(t, executable, []byte("old binary"))
+	if _, err := os.Stat(tx.dir); !os.IsNotExist(err) {
+		t.Fatalf("transaction remains: %v", err)
+	}
+}
+
+func TestSameVersionUpdateRunsNoOpMigrationWithoutPAT(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(release{TagName: "v0.1.0"})
+	}))
+	defer server.Close()
+	home := t.TempDir()
+	configDir := filepath.Join(home, ".config", "pdo")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(configDir, "config.json")
+	original := []byte(`{"schema_version":1,"unknown":true}`)
+	if err := os.WriteFile(configPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	u := updater{http: server.Client(), apiBase: server.URL, version: "v0.1.0", home: home}
+	var output bytes.Buffer
+	if err := u.run(false, &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "pdo v0.1.0 is up to date\n" {
+		t.Fatalf("output=%q", output.String())
+	}
+	assertFileContent(t, configPath, original)
+	if _, err := os.Stat(filepath.Join(configDir, ".update-transaction")); !os.IsNotExist(err) {
+		t.Fatalf("transaction was not cleaned: %v", err)
+	}
+}
+
+func TestUpdateInstallsVerifiedCandidate(t *testing.T) {
+	candidate := buildCandidate(t, "v0.1.1")
+	binary, err := os.ReadFile(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asset, err := updateAssetName(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := fmt.Sprintf("%x", sha256.Sum256(binary))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/releases/latest":
+			json.NewEncoder(w).Encode(release{TagName: "v0.1.1", Assets: []releaseAsset{{Name: asset}, {Name: "SHA256SUMS"}}})
+		case "/v0.1.1/SHA256SUMS":
+			fmt.Fprintf(w, "%s  %s\n", sum, asset)
+		case "/v0.1.1/" + asset:
+			w.Write(binary)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	home := t.TempDir()
+	target := filepath.Join(home, "pdo")
+	if runtime.GOOS == "windows" {
+		target += ".exe"
+	}
+	if err := os.WriteFile(target, []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	u := updater{
+		http:         server.Client(),
+		apiBase:      server.URL,
+		downloadBase: server.URL,
+		version:      "v0.1.0",
+		goos:         runtime.GOOS,
+		goarch:       runtime.GOARCH,
+		executable:   target,
+		home:         home,
+	}
+	var output bytes.Buffer
+	if err := u.run(false, &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "Updated pdo from v0.1.0 to v0.1.1\n" {
+		t.Fatalf("output=%q", output.String())
+	}
+	if err := verifyExecutableVersion(target, "v0.1.1"); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		if _, err := os.Stat(target + ".pdo-update-old"); err != nil {
+			t.Fatalf("Windows old executable was not retained: %v", err)
+		}
+		if err := cleanupOldExecutable(target); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestUpdateRejectsBadHashAndCandidateVersion(t *testing.T) {
+	candidate := buildCandidate(t, "v0.1.1")
+	binary, err := os.ReadFile(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asset, _ := updateAssetName(runtime.GOOS, runtime.GOARCH)
+	for _, test := range []struct {
+		name string
+		tag  string
+		sum  string
+		want string
+	}{
+		{name: "hash", tag: "v0.1.1", sum: strings.Repeat("0", 64), want: "checksum verification failed"},
+		{name: "version", tag: "v0.1.2", sum: fmt.Sprintf("%x", sha256.Sum256(binary)), want: "candidate version mismatch"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == "/releases/latest":
+					json.NewEncoder(w).Encode(release{TagName: test.tag, Assets: []releaseAsset{{Name: asset}, {Name: "SHA256SUMS"}}})
+				case strings.HasSuffix(r.URL.Path, "/SHA256SUMS"):
+					fmt.Fprintf(w, "%s  %s\n", test.sum, asset)
+				default:
+					w.Write(binary)
+				}
+			}))
+			defer server.Close()
+			home := t.TempDir()
+			target := filepath.Join(home, "pdo")
+			if runtime.GOOS == "windows" {
+				target += ".exe"
+			}
+			if err := os.WriteFile(target, []byte("old"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			u := updater{http: server.Client(), apiBase: server.URL, downloadBase: server.URL, version: "v0.1.0", goos: runtime.GOOS, goarch: runtime.GOARCH, executable: target, home: home}
+			if err := u.run(false, io.Discard); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v", err)
+			}
+			assertFileContent(t, target, []byte("old"))
+		})
+	}
+}
+
+func TestReplaceRunningExecutable(t *testing.T) {
+	if os.Getenv("PDO_REPLACE_TEST_CHILD") == "1" {
+		executable, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := replaceExecutable(executable, os.Getenv("PDO_REPLACE_TEST_STAGED"), 0o755, runtime.GOOS); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	dir := t.TempDir()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	running := filepath.Join(dir, "running")
+	staged := filepath.Join(dir, "staged")
+	if runtime.GOOS == "windows" {
+		running += ".exe"
+		staged += ".exe"
+	}
+	copyFile(t, executable, running, 0o755)
+	copyFile(t, executable, staged, 0o755)
+	command := exec.Command(running, "-test.run=^TestReplaceRunningExecutable$")
+	command.Env = append(os.Environ(), "PDO_REPLACE_TEST_CHILD=1", "PDO_REPLACE_TEST_STAGED="+staged)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("replace child: %v: %s", err, output)
+	}
+	if _, err := os.Stat(running); err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanupOldExecutable(running); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func buildCandidate(t *testing.T, candidateVersion string) string {
+	t.Helper()
+	dir := t.TempDir()
+	source := filepath.Join(dir, "main.go")
+	program := `package main
+import ("fmt"; "os")
+func main() {
+ if len(os.Args) == 2 && os.Args[1] == "version" { fmt.Println("pdo ` + candidateVersion + `"); return }
+ if len(os.Args) == 4 && os.Args[1] == "__pdo-migrate" { fmt.Println("0"); return }
+ os.Exit(2)
+}`
+	if err := os.WriteFile(source, []byte(program), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(dir, "candidate")
+	if runtime.GOOS == "windows" {
+		output += ".exe"
+	}
+	command := exec.Command(filepath.Join(runtime.GOROOT(), "bin", "go"), "build", "-o", output, source)
+	if data, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("build candidate: %v: %s", err, data)
+	}
+	return output
+}
+
+func copyFile(t *testing.T, source, destination string, mode os.FileMode) {
+	t.Helper()
+	data, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(destination, data, mode); err != nil {
+		t.Fatal(err)
 	}
 }
 

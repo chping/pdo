@@ -68,6 +68,11 @@ pdo upload dotfiles
 pdo download dotfiles --ssh-config
 pdo upload dotfiles --ssh-config --git-config
 
+pdo version
+pdo --version
+pdo update --check
+pdo update
+
 pdo --help
 ```
 
@@ -78,6 +83,14 @@ pdo --help
 `upload` 以本地内容为准，每个文件产生一个 GitHub commit，并通过当前 blob SHA 防止覆盖并发修改。内容相同时两个方向均不会写文件或提交。
 
 仅同步普通文件的原始字节；不支持目录、glob、删除、合并或跨文件事务。
+
+## 更新
+
+`pdo update --check` 只检查 GitHub 上的最新稳定 Release，不写入本地文件。`pdo update` 会校验同一 Release 中的 `SHA256SUMS`、验证候选二进制版本，然后替换当前实际执行文件。
+
+更新时会先锁定 `~/.config/pdo/.update-transaction`，备份需要迁移的 pdo 配置或数据以及旧二进制。迁移或切换失败会恢复已修改内容；恢复失败时会保留事务目录并输出路径。成功后会删除配置和数据备份。pdo 不扫描目录、不执行远程迁移脚本，也不会修改配置中列出的 dotfiles。
+
+普通 `go build` 生成的开发版本显示为 `pdo devel`，并拒绝执行更新。旧版 v0.1.0 尚无自更新能力，需要最后一次运行上面的安装脚本；安装新基线后，后续版本可使用 `pdo update`。
 
 ## 卸载
 
@@ -104,4 +117,4 @@ go test ./...
 go build .
 ```
 
-推送 `v*` tag 会在测试通过后发布 macOS、Linux、Windows 的 `amd64` / `arm64` 二进制、安装与卸载脚本及 `SHA256SUMS`。
+推送 `v*` tag 会注入 tag 作为版本号，并在测试通过后发布 macOS、Linux、Windows 的 `amd64` / `arm64` 二进制、安装与卸载脚本及 `SHA256SUMS`。重写后的 `v0.1.0` 是首个固定的自更新基线，后续发布必须使用新版本号。

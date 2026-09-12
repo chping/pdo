@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -9,10 +10,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -20,14 +23,22 @@ import (
 const (
 	supportedSchemaVersion = 1
 	maxAPIResponse         = 4 << 20
+	maxUpdateBinary        = 100 << 20
 	usage                  = `Usage:
   pdo download dotfiles [--<name> ...]
-  pdo upload dotfiles [--<name> ...]`
+  pdo upload dotfiles [--<name> ...]
+  pdo update [--check]
+  pdo version`
 )
 
 var (
-	githubAPIBase     = "https://api.github.com"
-	dotfileNameRegexp = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+	version              = "devel"
+	githubAPIBase        = "https://api.github.com"
+	releaseAPIBase       = "https://api.github.com/repos/chping/pdo"
+	releaseDownloadBase  = "https://github.com/chping/pdo/releases/download"
+	dotfileNameRegexp    = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+	versionRegexp        = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
+	configMigrationSteps = map[int]jsonMigration{}
 )
 
 type config struct {
@@ -68,13 +79,113 @@ type githubFile struct {
 	Type     string `json:"type"`
 }
 
+type semanticVersion [3]uint64
+
+type release struct {
+	TagName    string         `json:"tag_name"`
+	Draft      bool           `json:"draft"`
+	Prerelease bool           `json:"prerelease"`
+	Assets     []releaseAsset `json:"assets"`
+}
+
+type releaseAsset struct {
+	Name string `json:"name"`
+}
+
+type updater struct {
+	http         *http.Client
+	apiBase      string
+	downloadBase string
+	version      string
+	goos         string
+	goarch       string
+	executable   string
+	home         string
+}
+
+type jsonMigration func(map[string]json.RawMessage) error
+
+type transactionFile struct {
+	Path    string `json:"path"`
+	Backup  string `json:"backup,omitempty"`
+	Existed bool   `json:"existed"`
+	Mode    uint32 `json:"mode,omitempty"`
+}
+
+type transactionManifest struct {
+	Files []transactionFile `json:"files"`
+}
+
+type migrationTransaction struct {
+	dir      string
+	manifest transactionManifest
+}
+
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	args := os.Args[1:]
+	if !(len(args) == 2 && args[0] == "update" && args[1] == "--check") {
+		if executable, err := os.Executable(); err == nil {
+			if target, _, err := inspectExecutable(executable); err == nil {
+				if err := cleanupOldExecutable(target); err != nil {
+					fmt.Fprintf(os.Stderr, "pdo: %v\n", err)
+				}
+			}
+		}
+	}
+	os.Exit(run(args, os.Stdout, os.Stderr))
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 3 && args[0] == "__pdo-migrate" {
+		count, err := runInternalMigrations(args[1], args[2])
+		if err != nil {
+			fmt.Fprintf(stderr, "pdo: migrate: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(stdout, count)
+		return 0
+	}
+	if len(args) == 1 && (args[0] == "version" || args[0] == "--version") {
+		fmt.Fprintf(stdout, "pdo %s\n", version)
+		return 0
+	}
 	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
 		fmt.Fprintln(stdout, usage)
+		return 0
+	}
+	if len(args) >= 1 && args[0] == "update" {
+		if len(args) > 2 || (len(args) == 2 && args[1] != "--check") {
+			fmt.Fprintln(stderr, usage)
+			return 2
+		}
+		if version == "devel" {
+			fmt.Fprintln(stderr, "pdo: development builds cannot update")
+			return 1
+		}
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fmt.Fprintf(stderr, "pdo: find home directory: %v\n", err)
+			return 1
+		}
+		executable, err := os.Executable()
+		if err != nil {
+			fmt.Fprintf(stderr, "pdo: find executable: %v\n", err)
+			return 1
+		}
+		u := updater{
+			http:         &http.Client{Timeout: 30 * time.Second},
+			apiBase:      releaseAPIBase,
+			downloadBase: releaseDownloadBase,
+			version:      version,
+			goos:         runtime.GOOS,
+			goarch:       runtime.GOARCH,
+			executable:   executable,
+			home:         home,
+		}
+		if err := u.run(len(args) == 2, stdout); err != nil {
+			fmt.Fprintf(stderr, "pdo: update: %v\n", err)
+			return 1
+		}
 		return 0
 	}
 	if len(args) < 2 || (args[0] != "download" && args[0] != "upload") || args[1] != "dotfiles" {
@@ -524,4 +635,559 @@ func (client *githubClient) apiError(status int, body []byte) error {
 	}
 	message := strings.ReplaceAll(response.Message, client.token, "[redacted]")
 	return fmt.Errorf("GitHub API returned HTTP %d: %s", status, message)
+}
+
+func parseVersion(value string) (semanticVersion, error) {
+	match := versionRegexp.FindStringSubmatch(value)
+	if match == nil {
+		return semanticVersion{}, fmt.Errorf("invalid stable release version %q", value)
+	}
+	var parsed semanticVersion
+	for index := range parsed {
+		part, err := strconv.ParseUint(match[index+1], 10, 64)
+		if err != nil {
+			return semanticVersion{}, fmt.Errorf("invalid stable release version %q", value)
+		}
+		parsed[index] = part
+	}
+	return parsed, nil
+}
+
+func compareVersions(left, right semanticVersion) int {
+	for index := range left {
+		if left[index] < right[index] {
+			return -1
+		}
+		if left[index] > right[index] {
+			return 1
+		}
+	}
+	return 0
+}
+
+func (u updater) run(check bool, stdout io.Writer) error {
+	current, err := parseVersion(u.version)
+	if err != nil {
+		return err
+	}
+	latestRelease, latest, err := u.latestRelease()
+	if err != nil {
+		return err
+	}
+	comparison := compareVersions(current, latest)
+	if check {
+		if comparison < 0 {
+			fmt.Fprintf(stdout, "Update available: %s -> %s\n", u.version, latestRelease.TagName)
+		} else {
+			fmt.Fprintf(stdout, "pdo %s is up to date\n", u.version)
+		}
+		return nil
+	}
+	if comparison < 0 {
+		return u.install(latestRelease, stdout)
+	}
+
+	tx, err := startTransaction(u.home)
+	if err != nil {
+		return err
+	}
+	count, err := runOwnedMigrations(u.home, tx)
+	if err != nil {
+		return finishFailedTransaction(tx, err)
+	}
+	if err := tx.cleanup(); err != nil {
+		return fmt.Errorf("clean transaction %s: %w", tx.dir, err)
+	}
+	if comparison > 0 {
+		fmt.Fprintf(stdout, "pdo %s is newer than latest %s\n", u.version, latestRelease.TagName)
+	} else {
+		fmt.Fprintf(stdout, "pdo %s is up to date\n", u.version)
+	}
+	if count != 0 {
+		fmt.Fprintf(stdout, "Migrated %d pdo file(s)\n", count)
+	}
+	return nil
+}
+
+func (u updater) latestRelease() (release, semanticVersion, error) {
+	body, err := u.download(strings.TrimRight(u.apiBase, "/")+"/releases/latest", maxAPIResponse)
+	if err != nil {
+		return release{}, semanticVersion{}, err
+	}
+	var found release
+	if err := json.Unmarshal(body, &found); err != nil {
+		return release{}, semanticVersion{}, fmt.Errorf("decode latest release: %w", err)
+	}
+	parsed, err := parseVersion(found.TagName)
+	if err != nil {
+		return release{}, semanticVersion{}, err
+	}
+	if found.Draft || found.Prerelease {
+		return release{}, semanticVersion{}, fmt.Errorf("latest release %s is not stable", found.TagName)
+	}
+	return found, parsed, nil
+}
+
+func (u updater) download(address string, limit int64) ([]byte, error) {
+	request, err := http.NewRequest(http.MethodGet, address, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create update request: %w", err)
+	}
+	request.Header.Set("Accept", "application/vnd.github+json")
+	request.Header.Set("User-Agent", "pdo")
+	response, err := u.http.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("update request failed: %w", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("read update response: %w", err)
+	}
+	if len(body) > int(limit) {
+		return nil, fmt.Errorf("update response is too large")
+	}
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("update server returned HTTP %d", response.StatusCode)
+	}
+	return body, nil
+}
+
+func (u updater) install(found release, stdout io.Writer) error {
+	asset, err := updateAssetName(u.goos, u.goarch)
+	if err != nil {
+		return err
+	}
+	if !releaseHasAsset(found, asset) || !releaseHasAsset(found, "SHA256SUMS") {
+		return fmt.Errorf("release %s is missing %s or SHA256SUMS", found.TagName, asset)
+	}
+	base := strings.TrimRight(u.downloadBase, "/") + "/" + url.PathEscape(found.TagName)
+	checksums, err := u.download(base+"/SHA256SUMS", maxAPIResponse)
+	if err != nil {
+		return err
+	}
+	expected, err := checksumFor(checksums, asset)
+	if err != nil {
+		return err
+	}
+	binary, err := u.download(base+"/"+asset, maxUpdateBinary)
+	if err != nil {
+		return err
+	}
+	actual := fmt.Sprintf("%x", sha256.Sum256(binary))
+	if !strings.EqualFold(expected, actual) {
+		return fmt.Errorf("checksum verification failed for %s", asset)
+	}
+
+	target, info, err := inspectExecutable(u.executable)
+	if err != nil {
+		return err
+	}
+	if err := cleanupOldExecutable(target); err != nil {
+		return err
+	}
+	pattern := ".pdo-update-*"
+	if u.goos == "windows" {
+		pattern += ".exe"
+	}
+	staged, err := os.CreateTemp(filepath.Dir(target), pattern)
+	if err != nil {
+		return fmt.Errorf("create staged executable: %w", err)
+	}
+	stagedPath := staged.Name()
+	keepStaged := true
+	defer func() {
+		staged.Close()
+		if keepStaged {
+			os.Remove(stagedPath)
+		}
+	}()
+	if err := staged.Chmod(info.Mode().Perm()); err != nil {
+		return fmt.Errorf("set staged executable permissions: %w", err)
+	}
+	if _, err := staged.Write(binary); err != nil {
+		return fmt.Errorf("write staged executable: %w", err)
+	}
+	if err := staged.Sync(); err != nil {
+		return fmt.Errorf("sync staged executable: %w", err)
+	}
+	if err := staged.Close(); err != nil {
+		return fmt.Errorf("close staged executable: %w", err)
+	}
+	if err := verifyExecutableVersion(stagedPath, found.TagName); err != nil {
+		return err
+	}
+
+	tx, err := startTransaction(u.home)
+	if err != nil {
+		return err
+	}
+	output, commandErr := exec.Command(stagedPath, "__pdo-migrate", u.home, tx.dir).CombinedOutput()
+	transactionDir := tx.dir
+	tx, err = openTransaction(transactionDir)
+	if err != nil {
+		return fmt.Errorf("read migration transaction %s: %w; transaction retained", transactionDir, err)
+	}
+	if commandErr != nil {
+		return finishFailedTransaction(tx, fmt.Errorf("candidate migration failed: %v: %s", commandErr, strings.TrimSpace(string(output))))
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(string(output)))
+	if err != nil {
+		return finishFailedTransaction(tx, fmt.Errorf("candidate returned invalid migration result"))
+	}
+	backup, err := replaceExecutable(target, stagedPath, info.Mode().Perm(), u.goos)
+	if err != nil {
+		return finishFailedTransaction(tx, err)
+	}
+	keepStaged = false
+	if err := tx.cleanup(); err != nil {
+		return rollbackUpdate(tx, target, backup, u.goos, fmt.Errorf("clean transaction %s: %w", tx.dir, err))
+	}
+	if u.goos != "windows" {
+		if err := os.Remove(backup); err != nil {
+			return fmt.Errorf("updated, but could not remove old executable %s: %w", backup, err)
+		}
+	}
+	fmt.Fprintf(stdout, "Updated pdo from %s to %s\n", u.version, found.TagName)
+	if count != 0 {
+		fmt.Fprintf(stdout, "Migrated %d pdo file(s)\n", count)
+	}
+	return nil
+}
+
+func updateAssetName(goos, goarch string) (string, error) {
+	if (goos != "darwin" && goos != "linux" && goos != "windows") || (goarch != "amd64" && goarch != "arm64") {
+		return "", fmt.Errorf("unsupported update platform %s/%s", goos, goarch)
+	}
+	name := "pdo_" + goos + "_" + goarch
+	if goos == "windows" {
+		name += ".exe"
+	}
+	return name, nil
+}
+
+func releaseHasAsset(found release, name string) bool {
+	for _, asset := range found.Assets {
+		if asset.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func checksumFor(data []byte, name string) (string, error) {
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && strings.TrimPrefix(fields[1], "*") == name {
+			if len(fields[0]) != sha256.Size*2 {
+				break
+			}
+			return fields[0], nil
+		}
+	}
+	return "", fmt.Errorf("checksum not found for %s", name)
+}
+
+func inspectExecutable(path string) (string, os.FileInfo, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve executable: %w", err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", nil, fmt.Errorf("inspect executable: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", nil, fmt.Errorf("executable is not a regular file: %s", resolved)
+	}
+	return resolved, info, nil
+}
+
+func verifyExecutableVersion(path, want string) error {
+	output, err := exec.Command(path, "version").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("verify candidate version: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	if string(output) != "pdo "+want+"\n" {
+		return fmt.Errorf("candidate version mismatch: got %q, want %q", strings.TrimSpace(string(output)), "pdo "+want)
+	}
+	return nil
+}
+
+func cleanupOldExecutable(target string) error {
+	backup := target + ".pdo-update-old"
+	if err := os.Remove(backup); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove previous executable backup %s: %w", backup, err)
+	}
+	return nil
+}
+
+func replaceExecutable(target, staged string, mode os.FileMode, goos string) (string, error) {
+	backup := target + ".pdo-update-old"
+	if err := cleanupOldExecutable(target); err != nil {
+		return "", err
+	}
+	if goos == "windows" {
+		if err := os.Rename(target, backup); err != nil {
+			return "", fmt.Errorf("back up current executable: %w", err)
+		}
+		if err := os.Rename(staged, target); err != nil {
+			if restoreErr := os.Rename(backup, target); restoreErr != nil {
+				return backup, fmt.Errorf("install executable: %v; restore failed: %v; backup: %s", err, restoreErr, backup)
+			}
+			return "", fmt.Errorf("install executable: %w", err)
+		}
+		return backup, nil
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		return "", fmt.Errorf("read current executable: %w", err)
+	}
+	if err := writeExclusive(backup, data, mode); err != nil {
+		return "", fmt.Errorf("back up current executable: %w", err)
+	}
+	if err := os.Rename(staged, target); err != nil {
+		os.Remove(backup)
+		return "", fmt.Errorf("install executable: %w", err)
+	}
+	return backup, nil
+}
+
+func restoreExecutable(target, backup string, goos string) error {
+	if goos == "windows" {
+		if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return os.Rename(backup, target)
+}
+
+func rollbackUpdate(tx *migrationTransaction, target, backup, goos string, cause error) error {
+	binaryErr := restoreExecutable(target, backup, goos)
+	migrationErr := tx.rollback()
+	if binaryErr != nil || migrationErr != nil {
+		return fmt.Errorf("%v; rollback failed (binary: %v, files: %v); transaction retained at %s", cause, binaryErr, migrationErr, tx.dir)
+	}
+	if err := tx.cleanup(); err != nil {
+		return fmt.Errorf("%v; rollback completed but transaction remains at %s: %w", cause, tx.dir, err)
+	}
+	return cause
+}
+
+func startTransaction(home string) (*migrationTransaction, error) {
+	root := filepath.Join(home, ".config", "pdo")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, fmt.Errorf("create update directory: %w", err)
+	}
+	dir := filepath.Join(root, ".update-transaction")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		if os.IsExist(err) {
+			return nil, fmt.Errorf("another update or retained transaction exists at %s", dir)
+		}
+		return nil, fmt.Errorf("create update transaction: %w", err)
+	}
+	tx := &migrationTransaction{dir: dir}
+	if err := tx.save(); err != nil {
+		os.RemoveAll(dir)
+		return nil, err
+	}
+	return tx, nil
+}
+
+func openTransaction(dir string) (*migrationTransaction, error) {
+	data, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		return nil, err
+	}
+	tx := &migrationTransaction{dir: dir}
+	if err := json.Unmarshal(data, &tx.manifest); err != nil {
+		return nil, err
+	}
+	return tx, nil
+}
+
+func (tx *migrationTransaction) save() error {
+	data, err := json.Marshal(tx.manifest)
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(filepath.Join(tx.dir, "manifest.json"), append(data, '\n'), 0o600)
+}
+
+func (tx *migrationTransaction) backup(path string) error {
+	target, info, err := inspectLocalFile(path)
+	if err != nil {
+		return err
+	}
+	entry := transactionFile{Path: target}
+	if info != nil {
+		data, err := os.ReadFile(target)
+		if err != nil {
+			return err
+		}
+		entry.Existed = true
+		entry.Mode = uint32(info.Mode().Perm())
+		entry.Backup = fmt.Sprintf("file-%d", len(tx.manifest.Files))
+		if err := writeExclusive(filepath.Join(tx.dir, entry.Backup), data, 0o600); err != nil {
+			return err
+		}
+	}
+	tx.manifest.Files = append(tx.manifest.Files, entry)
+	return tx.save()
+}
+
+func (tx *migrationTransaction) rollback() error {
+	for index := len(tx.manifest.Files) - 1; index >= 0; index-- {
+		entry := tx.manifest.Files[index]
+		if !entry.Existed {
+			if err := os.Remove(entry.Path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(tx.dir, entry.Backup))
+		if err != nil {
+			return err
+		}
+		if err := atomicWriteFile(entry.Path, data, os.FileMode(entry.Mode)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (tx *migrationTransaction) cleanup() error {
+	return os.RemoveAll(tx.dir)
+}
+
+func finishFailedTransaction(tx *migrationTransaction, cause error) error {
+	if rollbackErr := tx.rollback(); rollbackErr != nil {
+		return fmt.Errorf("%v; rollback failed: %v; transaction retained at %s", cause, rollbackErr, tx.dir)
+	}
+	if cleanupErr := tx.cleanup(); cleanupErr != nil {
+		return fmt.Errorf("%v; rollback completed but transaction remains at %s: %w", cause, tx.dir, cleanupErr)
+	}
+	return cause
+}
+
+func runInternalMigrations(home, transactionDir string) (int, error) {
+	expected := filepath.Join(filepath.Clean(home), ".config", "pdo", ".update-transaction")
+	if !filepath.IsAbs(home) || filepath.Clean(transactionDir) != expected {
+		return 0, fmt.Errorf("invalid internal migration paths")
+	}
+	tx, err := openTransaction(transactionDir)
+	if err != nil {
+		return 0, err
+	}
+	count, err := runOwnedMigrations(home, tx)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func runOwnedMigrations(home string, tx *migrationTransaction) (int, error) {
+	changed, err := migrateJSONFile(filepath.Join(home, ".config", "pdo", "config.json"), supportedSchemaVersion, configMigrationSteps, tx)
+	if err != nil {
+		return 0, err
+	}
+	if changed {
+		return 1, nil
+	}
+	return 0, nil
+}
+
+func migrateJSONFile(path string, targetVersion int, steps map[int]jsonMigration, tx *migrationTransaction) (bool, error) {
+	resolved, info, err := inspectLocalFile(path)
+	if err != nil {
+		return false, err
+	}
+	if info == nil {
+		return false, nil
+	}
+	data, err := os.ReadFile(resolved)
+	if err != nil {
+		return false, err
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(data, &document); err != nil {
+		return false, fmt.Errorf("parse migration file %s: %w", path, err)
+	}
+	var schemaVersion int
+	if err := json.Unmarshal(document["schema_version"], &schemaVersion); err != nil {
+		return false, fmt.Errorf("parse schema_version in %s: %w", path, err)
+	}
+	if schemaVersion > targetVersion {
+		return false, fmt.Errorf("schema_version %d in %s is newer than supported %d", schemaVersion, path, targetVersion)
+	}
+	for current := schemaVersion; current < targetVersion; current++ {
+		if steps[current] == nil {
+			return false, fmt.Errorf("missing migration from schema_version %d", current)
+		}
+	}
+	if schemaVersion == targetVersion {
+		return false, nil
+	}
+	if err := tx.backup(path); err != nil {
+		return false, fmt.Errorf("back up %s: %w", path, err)
+	}
+	for schemaVersion < targetVersion {
+		if err := steps[schemaVersion](document); err != nil {
+			return false, fmt.Errorf("migrate %s from schema_version %d: %w", path, schemaVersion, err)
+		}
+		schemaVersion++
+		document["schema_version"] = json.RawMessage(strconv.Itoa(schemaVersion))
+	}
+	updated, err := json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	if err := atomicWriteFile(resolved, append(updated, '\n'), info.Mode().Perm()); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), ".pdo-update-file-*")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if err := temp.Chmod(mode); err != nil {
+		temp.Close()
+		return err
+	}
+	if _, err := temp.Write(data); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if runtime.GOOS != "windows" {
+		return os.Rename(tempPath, path)
+	}
+	swap := path + ".pdo-update-swap"
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return os.Rename(tempPath, path)
+	}
+	if err := os.Rename(path, swap); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		if restoreErr := os.Rename(swap, path); restoreErr != nil {
+			return fmt.Errorf("%v; restore failed: %v; backup: %s", err, restoreErr, swap)
+		}
+		return err
+	}
+	return os.Remove(swap)
 }

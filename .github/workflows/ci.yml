@@ -52,7 +52,7 @@ jobs:
             for pdo_arch in amd64 arm64; do
               pdo_output="dist/pdo_${pdo_os}_${pdo_arch}"
               if [ "$pdo_os" = windows ]; then pdo_output="${pdo_output}.exe"; fi
-              CGO_ENABLED=0 GOOS="$pdo_os" GOARCH="$pdo_arch" go build -trimpath -ldflags="-s -w" -o "$pdo_output" .
+              CGO_ENABLED=0 GOOS="$pdo_os" GOARCH="$pdo_arch" go build -trimpath -ldflags="-s -w -X main.version=$GITHUB_REF_NAME" -o "$pdo_output" .
             done
           done
           (cd dist && sha256sum pdo_* > SHA256SUMS)
