@@ -902,18 +902,24 @@ func TestRunUsageSelectorsAndExitCodes(t *testing.T) {
 
 func TestCopySSHIDArgumentParsing(t *testing.T) {
 	tests := []struct {
-		args     []string
-		config   string
-		identity string
-		wantErr  bool
+		args       []string
+		config     string
+		identity   string
+		targetHost string
+		wantErr    bool
 	}{
 		{args: []string{"--identity=key"}, identity: "key"},
 		{args: []string{"--config", "config", "--identity", "key"}, config: "config", identity: "key"},
 		{args: []string{"--identity", "key", "--config=config"}, config: "config", identity: "key"},
+		{args: []string{"--identity=key", "--target-host=openwrt"}, identity: "key", targetHost: "openwrt"},
+		{args: []string{"--target-host", "OpenWrt", "--identity", "key"}, identity: "key", targetHost: "OpenWrt"},
 		{args: nil, wantErr: true},
 		{args: []string{"--identity"}, wantErr: true},
 		{args: []string{"--identity="}, wantErr: true},
 		{args: []string{"--identity", "--config=config"}, wantErr: true},
+		{args: []string{"--identity=key", "--target-host"}, wantErr: true},
+		{args: []string{"--identity=key", "--target-host="}, wantErr: true},
+		{args: []string{"--identity=key", "--target-host=one", "--target-host=two"}, wantErr: true},
 		{args: []string{"--identity=one", "--identity", "two"}, wantErr: true},
 		{args: []string{"--unknown=value"}, wantErr: true},
 		{args: []string{"key"}, wantErr: true},
@@ -926,7 +932,7 @@ func TestCopySSHIDArgumentParsing(t *testing.T) {
 			}
 			continue
 		}
-		if err != nil || options.config != test.config || options.identity != test.identity {
+		if err != nil || options.config != test.config || options.identity != test.identity || options.targetHost != test.targetHost {
 			t.Errorf("args=%v options=%+v error=%v", test.args, options, err)
 		}
 	}
@@ -1068,6 +1074,54 @@ func TestRunCopySSHIDPreflightsThenContinues(t *testing.T) {
 	config := filepath.Join(sshDir, "config")
 	if strings.Join(calls[2].args, "|") != strings.Join([]string{"-i", identity, "-F", config, "Alpha"}, "|") {
 		t.Fatalf("copy args=%v", calls[2].args)
+	}
+}
+
+func TestRunCopySSHIDTargetHost(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(sshDir, "config"), "Host Alpha OpenWrt *.example !blocked\n")
+	writeTestFile(t, filepath.Join(sshDir, "id"), "private")
+	writeTestFile(t, filepath.Join(sshDir, "id.pub"), "public")
+
+	previousFind, previousRun, previousGOOS := findCommand, runCommand, copySSHIDGOOS
+	t.Cleanup(func() { findCommand, runCommand, copySSHIDGOOS = previousFind, previousRun, previousGOOS })
+	copySSHIDGOOS = "linux"
+	var lookups []string
+	findCommand = func(name string) (string, error) {
+		lookups = append(lookups, name)
+		return "/mock/" + name, nil
+	}
+	type call struct {
+		name string
+		args []string
+	}
+	var calls []call
+	runCommand = func(name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+		calls = append(calls, call{name: name, args: append([]string(nil), args...)})
+		return nil
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"copy-ssh-id", "--identity=~/.ssh/id", "--target-host=openwrt"}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "1 succeeded, 0 failed") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if len(calls) != 2 || calls[0].args[len(calls[0].args)-1] != "OpenWrt" || calls[1].args[len(calls[1].args)-1] != "OpenWrt" {
+		t.Fatalf("calls=%+v", calls)
+	}
+
+	for _, target := range []string{"missing", "*.example", "blocked"} {
+		lookups = nil
+		calls = nil
+		stdout.Reset()
+		stderr.Reset()
+		code := run([]string{"copy-ssh-id", "--identity=~/.ssh/id", "--target-host=" + target}, &stdout, &stderr)
+		if code != 1 || !strings.Contains(stderr.String(), "target Host") || len(lookups) != 0 || len(calls) != 0 {
+			t.Fatalf("target=%q code=%d lookups=%v calls=%v stderr=%q", target, code, lookups, calls, stderr.String())
+		}
 	}
 }
 

@@ -144,6 +144,9 @@ pdo copy-ssh-id --identity ~/.ssh/id_ed25519
 # 使用指定 SSH config；也支持 --identity=<path> 和 --config=<path>
 pdo copy-ssh-id --identity ~/.ssh/id_ed25519.pub --config ./ssh_config
 
+# 仅部署到 SSH config 中的指定 Host
+pdo copy-ssh-id --identity ~/.ssh/id_ed25519 --target-host=openwrt
+
 pdo version
 pdo --version
 pdo update --check
@@ -166,7 +169,7 @@ macOS 使用系统 AppKit 剪贴板，Windows 使用 PowerShell/.NET。Linux Way
 
 ### 部署 SSH 公钥
 
-`copy-ssh-id` 要求 `--identity`，`--config` 默认使用 `~/.ssh/config`。路径可以是绝对路径、`~/...` 或相对当前目录；identity 可以指向私钥基路径或 `.pub` 文件。pdo 会在开始连接前确认 config、私钥及对应公钥均为可读普通文件。
+`copy-ssh-id` 要求 `--identity`，`--config` 默认使用 `~/.ssh/config`。路径可以是绝对路径、`~/...` 或相对当前目录；identity 可以指向私钥基路径或 `.pub` 文件。可选的 `--target-host` 不区分大小写匹配一个字面 `Host` 别名；不指定时处理全部 Host，目标不存在时不会建立连接。pdo 会在开始连接前确认 config、私钥及对应公钥均为可读普通文件。
 
 pdo 按配置顺序处理字面 `Host` 别名，忽略通配符和否定模式并去重。根配置以及每个 Include 文件全局区域中的 `Include` 会递归展开；支持 `~/`、相对 `~/.ssh` 的路径和 glob，但不支持 Include 中的环境变量或 OpenSSH token。条件块中的 Include 不用于枚举 Host。
 

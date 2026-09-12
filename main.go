@@ -48,7 +48,7 @@ const (
   pdo paste
   pdo copy-file <file_path>
   pdo paste-file [save_path]
-  pdo copy-ssh-id --identity=<path> [--config=<path>]
+  pdo copy-ssh-id --identity=<path> [--config=<path>] [--target-host=<host>]
   pdo update [--check]
   pdo version`
 )
@@ -211,8 +211,9 @@ type migrationTransaction struct {
 }
 
 type copySSHIDOptions struct {
-	config   string
-	identity string
+	config     string
+	identity   string
+	targetHost string
 }
 
 func main() {
@@ -1259,27 +1260,34 @@ func parseCopySSHIDArgs(args []string) (copySSHIDOptions, error) {
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
 		name, value, hasValue := strings.Cut(arg, "=")
-		if name != "--config" && name != "--identity" {
+		if name != "--config" && name != "--identity" && name != "--target-host" {
 			return options, fmt.Errorf("invalid copy-ssh-id argument %q", arg)
 		}
 		if seen[name] {
 			return options, fmt.Errorf("duplicate copy-ssh-id argument %s", name)
 		}
 		seen[name] = true
+		required := "a path"
+		if name == "--target-host" {
+			required = "a Host alias"
+		}
 		if !hasValue {
 			index++
 			if index >= len(args) || strings.HasPrefix(args[index], "--") {
-				return options, fmt.Errorf("%s requires a path", name)
+				return options, fmt.Errorf("%s requires %s", name, required)
 			}
 			value = args[index]
 		}
 		if value == "" {
-			return options, fmt.Errorf("%s requires a path", name)
+			return options, fmt.Errorf("%s requires %s", name, required)
 		}
-		if name == "--config" {
+		switch name {
+		case "--config":
 			options.config = value
-		} else {
+		case "--identity":
 			options.identity = value
+		case "--target-host":
+			options.targetHost = value
 		}
 	}
 	if options.identity == "" {
@@ -1329,6 +1337,19 @@ func copySSHID(options copySSHIDOptions, stdout, stderr io.Writer) (bool, error)
 	}
 	if len(hosts) == 0 {
 		return false, fmt.Errorf("no literal Host aliases found in %s", options.config)
+	}
+	if options.targetHost != "" {
+		selected := ""
+		for _, host := range hosts {
+			if strings.EqualFold(host, options.targetHost) {
+				selected = host
+				break
+			}
+		}
+		if selected == "" {
+			return false, fmt.Errorf("target Host %q was not found in %s", options.targetHost, options.config)
+		}
+		hosts = []string{selected}
 	}
 	ssh, err := findCommand("ssh")
 	if err != nil {
