@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"golang.org/x/term"
@@ -1061,8 +1062,10 @@ func linuxClipboardWrite(kind string, data []byte) error {
 		if kind == "image-png" {
 			mimeType = "image/png"
 		}
-		_, err = clipboardCommandOutput(command, []string{"--type", mimeType}, bytes.NewReader(data))
-		return err
+		if err := runCommand(command, []string{"--type", mimeType}, bytes.NewReader(data), nil, nil); err != nil {
+			return fmt.Errorf("clipboard command failed: %w", err)
+		}
+		return nil
 	}
 	if os.Getenv("DISPLAY") == "" {
 		return fmt.Errorf("no graphical clipboard session (DISPLAY and WAYLAND_DISPLAY are unset); start a Wayland or X11 session and install clipboard support with: %s", linuxClipboardInstallCommand("wl-clipboard xclip"))
@@ -1075,8 +1078,10 @@ func linuxClipboardWrite(kind string, data []byte) error {
 	if kind == "image-png" {
 		mimeType = "image/png"
 	}
-	_, err = clipboardCommandOutput(command, []string{"-selection", "clipboard", "-target", mimeType, "-in"}, bytes.NewReader(data))
-	return err
+	if err := runCommand(command, []string{"-selection", "clipboard", "-target", mimeType, "-in"}, bytes.NewReader(data), nil, nil); err != nil {
+		return fmt.Errorf("clipboard command failed: %w", err)
+	}
+	return nil
 }
 
 func linuxClipboardInstallCommand(packageName string) string {
@@ -1139,7 +1144,7 @@ func windowsClipboardRead() (string, []byte, error) {
 	path := temporary.Name()
 	temporary.Close()
 	defer os.Remove(path)
-	kindOutput, err := clipboardCommandOutput(command, []string{"-NoProfile", "-NonInteractive", "-STA", "-Command", windowsClipboardReadScript, path}, nil)
+	kindOutput, err := clipboardCommandOutput(command, []string{"-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand", windowsPowerShellCommand(windowsClipboardReadScript, path)}, nil)
 	if err != nil {
 		return "", nil, err
 	}
@@ -1175,8 +1180,21 @@ func windowsClipboardWrite(kind string, data []byte) error {
 	if err := temporary.Close(); err != nil {
 		return fmt.Errorf("close clipboard temporary file: %w", err)
 	}
-	_, err = clipboardCommandOutput(command, []string{"-NoProfile", "-NonInteractive", "-STA", "-Command", windowsClipboardWriteScript, path, kind}, nil)
+	_, err = clipboardCommandOutput(command, []string{"-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand", windowsPowerShellCommand(windowsClipboardWriteScript, path, kind)}, nil)
 	return err
+}
+
+func windowsPowerShellCommand(script string, arguments ...string) string {
+	command := "& {\n" + script + "\n}"
+	for _, argument := range arguments {
+		command += " '" + strings.ReplaceAll(argument, "'", "''") + "'"
+	}
+	units := utf16.Encode([]rune(command))
+	data := make([]byte, len(units)*2)
+	for index, unit := range units {
+		data[index*2], data[index*2+1] = byte(unit), byte(unit>>8)
+	}
+	return base64.StdEncoding.EncodeToString(data)
 }
 
 func clipboardCommandOutput(name string, arguments []string, input io.Reader) ([]byte, error) {

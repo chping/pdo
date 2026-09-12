@@ -836,6 +836,9 @@ func TestClipboardPlatformCommands(t *testing.T) {
 			if strings.Join(args, " ") != "--type image/png" {
 				t.Errorf("write args=%v", args)
 			}
+			if stdout != nil || stderr != nil {
+				t.Errorf("write stdout=%v stderr=%v", stdout, stderr)
+			}
 			return nil
 		}
 		kind, data, err := linuxClipboardRead()
@@ -925,8 +928,22 @@ func TestClipboardPlatformCommands(t *testing.T) {
 	})
 
 	t.Run("Windows temporary file", func(t *testing.T) {
+		temporary := filepath.Join(t.TempDir(), "PowerShell user's files")
+		if err := os.Mkdir(temporary, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("TMPDIR", temporary)
+		t.Setenv("TEMP", temporary)
+		t.Setenv("TMP", temporary)
 		runCommand = func(name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
-			path := args[len(args)-1]
+			if len(args) != 5 || args[3] != "-EncodedCommand" {
+				t.Fatalf("PowerShell args=%q", args)
+			}
+			matches, err := filepath.Glob(filepath.Join(temporary, "pdo-clipboard-*"))
+			if err != nil || len(matches) != 1 {
+				t.Fatalf("temporary files=%v error=%v", matches, err)
+			}
+			path := matches[0]
 			if err := os.WriteFile(path, []byte("windows text"), 0o600); err != nil {
 				return err
 			}
@@ -937,7 +954,54 @@ func TestClipboardPlatformCommands(t *testing.T) {
 		if err != nil || kind != "text" || string(data) != "windows text" {
 			t.Fatalf("kind=%q data=%q error=%v", kind, data, err)
 		}
+
+		runCommand = func(name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+			if len(args) != 5 || args[3] != "-EncodedCommand" {
+				t.Fatalf("PowerShell args=%q", args)
+			}
+			return nil
+		}
+		if err := windowsClipboardWrite("text", []byte("windows text")); err != nil {
+			t.Fatal(err)
+		}
 	})
+}
+
+func TestWindowsPowerShellEncodedArguments(t *testing.T) {
+	powershell := "powershell.exe"
+	if runtime.GOOS != "windows" {
+		var err error
+		powershell, err = exec.LookPath("pwsh")
+		if err != nil {
+			t.Skip("PowerShell is unavailable")
+		}
+	}
+	encoded := windowsPowerShellCommand(`[Console]::Out.Write(($args -join '|'))`, `C:\path with space\user's file`, "text")
+	output, err := exec.Command(powershell, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded).CombinedOutput()
+	if err != nil || string(output) != `C:\path with space\user's file|text` {
+		t.Fatalf("output=%q error=%v", output, err)
+	}
+}
+
+func TestLinuxClipboardWriteDoesNotWaitForClipboardOwner(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell behavior")
+	}
+	command := filepath.Join(t.TempDir(), "wl-copy")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nsleep 2 &\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	previous := findCommand
+	findCommand = func(string) (string, error) { return command, nil }
+	t.Cleanup(func() { findCommand = previous })
+	t.Setenv("WAYLAND_DISPLAY", "wayland-0")
+	started := time.Now()
+	if err := linuxClipboardWrite("text", []byte("text")); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("clipboard write waited %s for background owner", elapsed)
+	}
 }
 
 func TestParseRemoteRejectsInvalidURLs(t *testing.T) {
