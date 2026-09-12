@@ -68,7 +68,7 @@ if [ ! -e "$pdo_config" ] && [ ! -L "$pdo_config" ]; then
   },
   "dotfiles": {
     "ssh-config": {
-      "remote": "https://api.github.com/repos/OWNER/REPOSITORY/contents/ssh_config?ref=main",
+      "remote": "https://github.com/OWNER/REPOSITORY/blob/main/ssh_config",
       "local": "~/.ssh/config"
     }
   }

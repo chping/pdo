@@ -32,18 +32,18 @@ irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
   },
   "dotfiles": {
     "ssh-config": {
-      "remote": "https://api.github.com/repos/OWNER/REPOSITORY/contents/ssh_config?ref=main",
+      "remote": "https://github.com/OWNER/REPOSITORY/blob/main/ssh_config",
       "local": "~/.ssh/config"
     },
     "git-config": {
-      "remote": "https://api.github.com/repos/OWNER/REPOSITORY/contents/git_config?ref=main",
+      "remote": "https://github.com/OWNER/REPOSITORY/blob/main/git_config",
       "local": "~/.gitconfig"
     }
   }
 }
 ```
 
-dotfile 名称使用 kebab-case，并对应命令行的 `--<名称>`。`remote` 必须是带 `ref` 的 GitHub Contents API URL；`local` 必须以 `~/` 开头或使用当前平台的绝对路径。
+dotfile 名称使用 kebab-case，并对应命令行的 `--<名称>`。`remote` 使用 GitHub 文件页面的标准链接 `https://github.com/OWNER/REPOSITORY/blob/BRANCH/PATH`；`local` 必须以 `~/` 开头或使用当前平台的绝对路径。pdo 会在内部将文件链接转换为 GitHub Contents API 请求。
 
 创建一个仅能访问目标私有仓库的 GitHub fine-grained personal access token，并赋予 Contents 读写权限。token 只从配置指定的环境变量读取：
 

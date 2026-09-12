@@ -212,24 +212,19 @@ func parseRemote(value string) (string, string, string, error) {
 	if err != nil {
 		return "", "", "", fmt.Errorf("invalid URL: %w", err)
 	}
-	if remote.Scheme != "https" || remote.Host != "api.github.com" || remote.User != nil || remote.Fragment != "" {
-		return "", "", "", fmt.Errorf("must be an https://api.github.com Contents API URL without credentials or fragment")
-	}
-	query := remote.Query()
-	refs, ok := query["ref"]
-	if len(query) != 1 || !ok || len(refs) != 1 || refs[0] == "" {
-		return "", "", "", fmt.Errorf("must contain exactly one non-empty ref query parameter")
+	if remote.Scheme != "https" || remote.Host != "github.com" || remote.User != nil || remote.RawQuery != "" || remote.Fragment != "" {
+		return "", "", "", fmt.Errorf("must be an https://github.com file URL without credentials, query, or fragment")
 	}
 	parts := strings.Split(strings.TrimPrefix(remote.Path, "/"), "/")
-	if len(parts) < 5 || parts[0] != "repos" || parts[3] != "contents" || invalidPathPart(parts[1]) || invalidPathPart(parts[2]) {
-		return "", "", "", fmt.Errorf("must match /repos/OWNER/REPOSITORY/contents/PATH")
+	if len(parts) < 5 || parts[2] != "blob" || invalidPathPart(parts[0]) || invalidPathPart(parts[1]) || invalidPathPart(parts[3]) {
+		return "", "", "", fmt.Errorf("must match /OWNER/REPOSITORY/blob/BRANCH/PATH")
 	}
 	for _, part := range parts[4:] {
 		if invalidPathPart(part) {
 			return "", "", "", fmt.Errorf("content path must not contain empty, . or .. segments")
 		}
 	}
-	return parts[1] + "/" + parts[2], refs[0], strings.Join(parts[4:], "/"), nil
+	return parts[0] + "/" + parts[1], parts[3], strings.Join(parts[4:], "/"), nil
 }
 
 func invalidPathPart(part string) bool {

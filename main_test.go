@@ -21,7 +21,7 @@ func TestConfigValidation(t *testing.T) {
 		GitHub:        githubConfig{PATEnv: "PDO_GITHUB_PAT"},
 		Dotfiles: map[string]dotfileConfig{
 			"ssh-config": {
-				Remote: "https://api.github.com/repos/owner/repo/contents/ssh/config?ref=feature%2Fone",
+				Remote: "https://github.com/owner/repo/blob/main/ssh/config",
 				Local:  "~/.ssh/config",
 			},
 		},
@@ -38,9 +38,9 @@ func TestConfigValidation(t *testing.T) {
 		{name: "reserved key", mutate: func(cfg *config) { cfg.Dotfiles = map[string]dotfileConfig{"help": cfg.Dotfiles["ssh-config"]} }, wantErr: "must not be help"},
 		{name: "invalid remote", mutate: func(cfg *config) {
 			item := cfg.Dotfiles["ssh-config"]
-			item.Remote = "https://github.com/owner/repo/blob/main/config"
+			item.Remote = "https://api.github.com/repos/owner/repo/contents/config?ref=main"
 			cfg.Dotfiles["ssh-config"] = item
-		}, wantErr: "Contents API URL"},
+		}, wantErr: "github.com file URL"},
 		{name: "relative local", mutate: func(cfg *config) {
 			item := cfg.Dotfiles["ssh-config"]
 			item.Local = ".ssh/config"
@@ -62,7 +62,7 @@ func TestConfigValidation(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if prepared["ssh-config"].local != filepath.Join(home, ".ssh", "config") || prepared["ssh-config"].branch != "feature/one" {
+				if prepared["ssh-config"].local != filepath.Join(home, ".ssh", "config") || prepared["ssh-config"].branch != "main" {
 					t.Fatalf("prepared = %+v", prepared["ssh-config"])
 				}
 				return
@@ -92,13 +92,13 @@ func TestLoadConfigSchemaAndUnknownSection(t *testing.T) {
 
 func TestParseRemoteRejectsInvalidURLs(t *testing.T) {
 	invalid := []string{
-		"http://api.github.com/repos/o/r/contents/a?ref=main",
-		"https://token@api.github.com/repos/o/r/contents/a?ref=main",
-		"https://api.github.com/repos/o/r/contents/a",
-		"https://api.github.com/repos/o/r/contents/a?ref=main&download=1",
-		"https://api.github.com/repos/o/r/contents/../a?ref=main",
-		"https://api.github.com/repos/o/r/contents/?ref=main",
-		"https://api.github.com/repos/o/r/contents/a?ref=main#fragment",
+		"http://github.com/o/r/blob/main/a",
+		"https://token@github.com/o/r/blob/main/a",
+		"https://github.com/o/r/main/a",
+		"https://github.com/o/r/blob/main/a?plain=1",
+		"https://github.com/o/r/blob/main/../a",
+		"https://github.com/o/r/blob/main/",
+		"https://github.com/o/r/blob/main/a#L1",
 	}
 	for _, value := range invalid {
 		if _, _, _, err := parseRemote(value); err == nil {
@@ -437,7 +437,7 @@ func testClient(t *testing.T, server *httptest.Server) *githubClient {
 }
 
 func remoteURL(path string) string {
-	return "https://api.github.com/repos/owner/repo/contents/" + path + "?ref=main"
+	return "https://github.com/owner/repo/blob/main/" + path
 }
 
 func setHome(t *testing.T, home string) {
