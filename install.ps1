@@ -53,9 +53,8 @@ try {
 {
   "schema_version": 1,
   "cloud_clipboard": {
-    "host": "https://clipboard-api.example.com/",
-    "prefix": "personal",
-    "username": "pdo",
+    "host": "https://clipboard.example.com/",
+    "room": "personal",
     "password_env": "PDO_CLOUD_CLIPBOARD_PASSWORD"
   },
   "github": {

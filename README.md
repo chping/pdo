@@ -28,9 +28,8 @@ irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
 {
   "schema_version": 1,
   "cloud_clipboard": {
-    "host": "https://clipboard-api.example.com/",
-    "prefix": "personal",
-    "username": "pdo",
+    "host": "https://clipboard.example.com/",
+    "room": "personal",
     "password_env": "PDO_CLOUD_CLIPBOARD_PASSWORD"
   },
   "github": {
@@ -51,32 +50,23 @@ irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
 
 ### 配置跨设备 Copy & Paste
 
-该功能沿用 [cloud-clipboard](https://github.com/yusanshi/cloud-clipboard) 的 Redis + [Webdis](https://github.com/nicolasff/webdis) 架构。pdo 运行时只访问 Webdis HTTP 中转接口，不依赖 cloud-clipboard 的网页或 Python 客户端。pdo 使用 `<prefix>:pdo:...` 专用键，因此可与原客户端共用 Redis，但两者不共享剪贴板或文件记录。
+该功能使用 [cloud-clipboard-go](https://github.com/Jonnyan404/cloud-clipboard-go) v5.0.6 或更高版本提供的 HTTP API。pdo 只把服务作为中转接口，不依赖网页客户端，也不直接访问其存储。
 
-1. 复用已部署 cloud-clipboard 的 Webdis，并为 pdo 配置独立的 HTTP Basic Auth 账号。以下 `webdis.json` 片段适用于仅向 pdo 开放的入口：
+1. 按 [cloud-clipboard-go 配置文档](https://github.com/Jonnyan404/cloud-clipboard-go/blob/main/cloud-clip/config.md) 部署服务，并至少设置：
 
-   ```json
-   {
-     "http_max_request_size": 134217728,
-     "acl": [
-       {
-         "disabled": ["*"]
-       },
-       {
-         "http_basic_auth": "pdo:your-password",
-         "enabled": ["MSET", "MGET"]
-       }
-     ]
-   }
+   ```env
+   AUTH_PASSWORD=your-password
+   TEXT_LIMIT=67108864
+   FILE_LIMIT=67108864
    ```
 
-   Webdis 的 ACL 按顺序覆盖，所以通配禁用规则必须放在 pdo 规则之前。如果原 cloud-clipboard 客户端仍在使用，请保留它的账号及 ACL，不要用上述片段整体覆盖现有 `acl`。
+   `MESSAGE_NUM` 控制历史记录条数，`FILE_EXPIRE` 控制文件保留时间，由服务部署方自行设置。pdo 始终只读取对应房间的最新一条记录。
 
-2. 通过 HTTPS 反向代理暴露 Webdis 根路径，不要将 Redis 或 Webdis 端口直接公开。Nginx 可在现有 TLS `server` 中使用：
+2. 通过 HTTPS 暴露 cloud-clipboard-go，不要直接公开未加密的 HTTP 端口。Nginx 可在现有 TLS `server` 中使用：
 
    ```nginx
    location / {
-       proxy_pass http://127.0.0.1:7379;
+       proxy_pass http://127.0.0.1:9501;
        client_max_body_size 128m;
        proxy_read_timeout 600s;
        proxy_send_timeout 600s;
@@ -85,12 +75,11 @@ irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
 
 3. 在每台设备的 `~/.config/pdo/config.json` 中填写相同的 `cloud_clipboard` 段：
 
-   - `host`：Webdis 的 HTTPS 根地址，例如 `https://clipboard-api.example.com/`；不是 cloud-clipboard 网页、Redis 地址或子路径，且不能包含凭据、query 或 fragment。
-   - `prefix`：共享空间名；需互通的设备使用同一值，需隔离时使用不同值。
-   - `username`：与 Webdis `http_basic_auth` 中冒号前的用户名一致。
+   - `host`：cloud-clipboard-go 的 HTTPS 服务基址，例如 `https://clipboard.example.com/`。如果服务设置了 `PREFIX=/clipboard`，则填写 `https://clipboard.example.com/clipboard/`。不能包含凭据、query 或 fragment。
+   - `room`：设备间共享的房间前缀。pdo 自动使用 `<room>-pdo-clipboard` 和 `<room>-pdo-file` 两个独立房间。
    - `password_env`：保存密码的环境变量名，不是密码本身。
 
-4. 在每台设备上设置与 Webdis `http_basic_auth` 中冒号后一致的密码：
+4. 在每台设备上设置与服务端 `AUTH_PASSWORD` 相同的密码：
 
    ```sh
    export PDO_CLOUD_CLIPBOARD_PASSWORD="your-password"
@@ -100,7 +89,9 @@ irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
    $env:PDO_CLOUD_CLIPBOARD_PASSWORD = "your-password"
    ```
 
-`cloud_clipboard` 段是可选的，只在调用四个跨设备命令时校验，旧配置无需迁移。Webdis 及反向代理的请求体上限必须高于 64 MiB。内容以明文保存在自管 Redis 中，不提供端到端加密。修改 Webdis 或反向代理配置后，请重启或重载对应服务。
+`cloud_clipboard` 段是可选的，只在调用四个跨设备命令时校验。反向代理必须允许至少 64 MiB 请求体，读写超时应不少于 600 秒。
+
+从 v0.1.2 升级到 v0.1.3 时必须手工把原来的 `prefix`、`username` 改为 `room`，并把 `host` 改为 cloud-clipboard-go 服务基址；Webdis 中已有的暂存内容不会迁移。内容由自管的 cloud-clipboard-go 保存，不提供端到端加密。
 
 dotfile 名称使用 kebab-case，并对应命令行的 `--<名称>`。`remote` 使用 GitHub 文件页面的标准链接 `https://github.com/OWNER/REPOSITORY/blob/BRANCH/PATH`；`local` 必须以 `~/` 开头或使用当前平台的绝对路径。pdo 会在内部将文件链接转换为 GitHub Contents API 请求。
 
@@ -153,7 +144,7 @@ pdo update
 pdo --help
 ```
 
-文本/图片与文件使用两个独立的最近一次槽位，单项最大 64 MiB，不自动过期。`copy-file` 和 `paste-file` 仅在 stderr 连接终端时显示传输进度；下载遇到同名文件会使用 `name (1).ext` 等新名称，不覆盖已有文件。
+文本/图片与文件分别使用 `<room>-pdo-clipboard` 和 `<room>-pdo-file`，单项最大 64 MiB。历史条数和文件过期时间遵循 cloud-clipboard-go 的 `MESSAGE_NUM`、`FILE_EXPIRE` 配置；pdo 不扫描历史。`copy-file` 和 `paste-file` 仅在 stderr 连接终端时显示传输进度；下载遇到同名文件会使用 `name (1).ext` 等新名称，不覆盖已有文件。
 
 macOS 使用系统 AppKit 剪贴板，Windows 使用 PowerShell/.NET。Linux Wayland 需要 `wl-clipboard`，X11 需要 `xclip`；剪贴板同时含图片和文本时优先使用图片。
 

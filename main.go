@@ -24,11 +24,14 @@ import (
 )
 
 const (
-	supportedSchemaVersion = 1
-	maxAPIResponse         = 4 << 20
-	maxUpdateBinary        = 100 << 20
-	maxClipboardPayload    = 64 << 20
-	usage                  = `Usage:
+	supportedSchemaVersion  = 1
+	maxAPIResponse          = 4 << 20
+	maxUpdateBinary         = 100 << 20
+	maxClipboardPayload     = 64 << 20
+	maxCloudControlResponse = 64 << 10
+	maxCloudTextResponse    = 6*maxClipboardPayload + maxCloudControlResponse
+	cloudUploadChunkSize    = 1 << 20
+	usage                   = `Usage:
   pdo download dotfiles [--<name> ...]
   pdo upload dotfiles [--<name> ...]
   pdo copy ["text"]
@@ -47,6 +50,7 @@ var (
 	releaseDownloadBase  = "https://github.com/chping/pdo/releases/download"
 	dotfileNameRegexp    = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 	versionRegexp        = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
+	uuidRegexp           = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 	configMigrationSteps = map[int]jsonMigration{}
 	findCommand          = exec.LookPath
 	runCommand           = func(name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -80,8 +84,7 @@ type config struct {
 
 type cloudClipboardConfig struct {
 	Host        string `json:"host"`
-	Prefix      string `json:"prefix"`
-	Username    string `json:"username"`
+	Room        string `json:"room"`
 	PasswordEnv string `json:"password_env"`
 }
 
@@ -110,12 +113,20 @@ type githubClient struct {
 	message    string
 }
 
-type webdisClient struct {
-	http     *http.Client
-	host     string
-	prefix   string
-	username string
-	password string
+type cloudClipboardClient struct {
+	http          *http.Client
+	host          string
+	password      string
+	clipboardRoom string
+	fileRoom      string
+}
+
+type cloudContent struct {
+	Type    string  `json:"type"`
+	Content *string `json:"content"`
+	Name    string  `json:"name"`
+	Size    *int64  `json:"size"`
+	UUID    string  `json:"uuid"`
 }
 
 type transferProgress struct {
@@ -397,19 +408,37 @@ func runCloudClipboard(args []string, stdout, stderr io.Writer) error {
 		if _, _, err := validateClipboardPayload(kind, data); err != nil {
 			return err
 		}
-		return client.putPair(client.prefix+":pdo:clipboard:type", kind, client.prefix+":pdo:clipboard:data", bytes.NewReader(data), int64(len(data)))
+		if kind == "text" {
+			return client.postText(data)
+		}
+		return client.uploadFile(client.clipboardRoom, "clipboard.png", bytes.NewReader(data), int64(len(data)), nil)
 
 	case "paste":
-		var kind string
-		var data []byte
-		err := client.getPair(client.prefix+":pdo:clipboard:type", client.prefix+":pdo:clipboard:data", func(metadata string, size int64, reader io.Reader) error {
-			kind = metadata
-			data = make([]byte, size)
-			_, err := io.ReadFull(reader, data)
-			return err
-		})
+		content, err := client.latest(client.clipboardRoom, maxCloudTextResponse)
 		if err != nil {
 			return err
+		}
+		var kind string
+		var data []byte
+		switch {
+		case content.Content != nil && content.UUID == "":
+			if content.Type != "text" {
+				return fmt.Errorf("invalid cloud clipboard text response")
+			}
+			kind = "text"
+			data = []byte(*content.Content)
+		case content.Content == nil && content.UUID != "" && content.Size != nil:
+			kind = "image-png"
+			var buffer bytes.Buffer
+			if *content.Size >= 0 && *content.Size <= maxClipboardPayload {
+				buffer.Grow(int(*content.Size))
+			}
+			if _, err := client.downloadFile(client.clipboardRoom, content.UUID, *content.Size, &buffer); err != nil {
+				return err
+			}
+			data = buffer.Bytes()
+		default:
+			return fmt.Errorf("invalid cloud clipboard response")
 		}
 		width, height, err := validateClipboardPayload(kind, data)
 		if err != nil {
@@ -445,14 +474,12 @@ func runCloudClipboard(args []string, stdout, stderr io.Writer) error {
 		if !utf8.ValidString(name) {
 			return fmt.Errorf("file name is not valid UTF-8")
 		}
-		var body io.Reader = file
 		var progress *transferProgress
 		if isTerminal(stderr) {
 			progress = newTransferProgress(stderr, info.Size())
-			body = io.TeeReader(file, progress)
 			defer progress.finish()
 		}
-		return client.putPair(client.prefix+":pdo:file:name", name, client.prefix+":pdo:file:data", body, info.Size())
+		return client.uploadFile(client.fileRoom, name, file, info.Size(), progress)
 
 	case "paste-file":
 		directory := "."
@@ -470,242 +497,286 @@ func runCloudClipboard(args []string, stdout, stderr io.Writer) error {
 		if !info.IsDir() {
 			return fmt.Errorf("save path is not a directory: %s", directory)
 		}
-
-		var savedPath string
-		fileComplete := false
-		err = client.getPair(client.prefix+":pdo:file:name", client.prefix+":pdo:file:data", func(name string, size int64, reader io.Reader) error {
-			if err := validateDownloadedFileName(name); err != nil {
-				return err
-			}
-			file, path, err := createDownloadFile(directory, name)
-			if err != nil {
-				return err
-			}
-			savedPath = path
-			ok := false
-			defer func() {
-				file.Close()
-				if !ok {
-					os.Remove(path)
-				}
-			}()
-			if runtime.GOOS != "windows" {
-				if err := file.Chmod(0o600); err != nil {
-					return fmt.Errorf("set file permissions: %w", err)
-				}
-			}
-			var progress *transferProgress
-			writer := io.Writer(file)
-			if isTerminal(stderr) {
-				progress = newTransferProgress(stderr, size)
-				writer = io.MultiWriter(file, progress)
-				defer progress.finish()
-			}
-			written, err := io.Copy(writer, reader)
-			if err != nil {
-				return fmt.Errorf("write downloaded file: %w", err)
-			}
-			if written != size {
-				return fmt.Errorf("downloaded file length is %d, expected %d", written, size)
-			}
-			if err := file.Sync(); err != nil {
-				return fmt.Errorf("sync downloaded file: %w", err)
-			}
-			if err := file.Close(); err != nil {
-				return fmt.Errorf("close downloaded file: %w", err)
-			}
-			ok = true
-			fileComplete = true
-			return nil
-		})
+		content, err := client.latest(client.fileRoom, maxCloudControlResponse)
 		if err != nil {
-			if fileComplete {
-				if removeErr := os.Remove(savedPath); removeErr != nil && !os.IsNotExist(removeErr) {
-					return fmt.Errorf("%v; remove incomplete file: %v", err, removeErr)
-				}
-			}
 			return err
 		}
+		if content.Content != nil || content.Name == "" || content.UUID == "" || content.Size == nil {
+			return fmt.Errorf("latest cloud file room entry is not a file")
+		}
+		if err := validateDownloadedFileName(content.Name); err != nil {
+			return err
+		}
+		if *content.Size < 0 || *content.Size > maxClipboardPayload {
+			return fmt.Errorf("cloud file exceeds 64 MiB limit")
+		}
+		file, savedPath, err := createDownloadFile(directory, content.Name)
+		if err != nil {
+			return err
+		}
+		ok := false
+		defer func() {
+			file.Close()
+			if !ok {
+				os.Remove(savedPath)
+			}
+		}()
+		if runtime.GOOS != "windows" {
+			if err := file.Chmod(0o600); err != nil {
+				return fmt.Errorf("set file permissions: %w", err)
+			}
+		}
+		var progress *transferProgress
+		writer := io.Writer(file)
+		if isTerminal(stderr) {
+			progress = newTransferProgress(stderr, *content.Size)
+			writer = io.MultiWriter(file, progress)
+			defer progress.finish()
+		}
+		if _, err := client.downloadFile(client.fileRoom, content.UUID, *content.Size, writer); err != nil {
+			return err
+		}
+		if err := file.Sync(); err != nil {
+			return fmt.Errorf("sync downloaded file: %w", err)
+		}
+		if err := file.Close(); err != nil {
+			return fmt.Errorf("close downloaded file: %w", err)
+		}
+		ok = true
 		_, err = fmt.Fprintln(stdout, savedPath)
 		return err
 	}
 	return nil
 }
 
-func (cfg config) prepareCloudClipboard() (*webdisClient, error) {
+func (cfg config) prepareCloudClipboard() (*cloudClipboardClient, error) {
 	item := cfg.CloudClipboard
-	if item.Host == "" || item.Prefix == "" || item.Username == "" || item.PasswordEnv == "" {
-		return nil, fmt.Errorf("cloud_clipboard.host, prefix, username, and password_env are required")
+	room := strings.TrimSpace(item.Room)
+	if item.Host == "" || room == "" || item.PasswordEnv == "" {
+		return nil, fmt.Errorf("cloud_clipboard.host, room, and password_env are required; Webdis prefix/username configuration is no longer supported")
 	}
 	parsed, err := url.Parse(item.Host)
 	if err != nil {
 		return nil, fmt.Errorf("cloud_clipboard.host: invalid URL: %w", err)
 	}
-	if parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(item.Host, "#") || (parsed.Path != "" && parsed.Path != "/") {
-		return nil, fmt.Errorf("cloud_clipboard.host must be an HTTPS Webdis root URL without credentials, path, query, or fragment")
+	if parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(item.Host, "#") {
+		return nil, fmt.Errorf("cloud_clipboard.host must be an HTTPS cloud-clipboard-go base URL without credentials, query, or fragment")
 	}
 	password := os.Getenv(item.PasswordEnv)
 	if password == "" {
 		return nil, fmt.Errorf("environment variable %s is empty", item.PasswordEnv)
 	}
 	httpClient := cloudHTTPClient()
-	if httpClient.CheckRedirect == nil {
-		httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	}
-	return &webdisClient{
-		http:     httpClient,
-		host:     strings.TrimRight(item.Host, "/"),
-		prefix:   item.Prefix,
-		username: item.Username,
-		password: password,
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &cloudClipboardClient{
+		http:          httpClient,
+		host:          strings.TrimRight(item.Host, "/"),
+		password:      password,
+		clipboardRoom: room + "-pdo-clipboard",
+		fileRoom:      room + "-pdo-file",
 	}, nil
 }
 
-func (client *webdisClient) putPair(metadataKey, metadata, dataKey string, body io.Reader, size int64) error {
-	request, err := http.NewRequest(http.MethodPut, client.endpoint("MSET", metadataKey, metadata, dataKey), body)
-	if err != nil {
-		return fmt.Errorf("create Webdis request: %w", err)
+func (client *cloudClipboardClient) endpoint(path string, query url.Values) string {
+	endpoint := client.host + "/" + strings.TrimLeft(path, "/")
+	if len(query) != 0 {
+		endpoint += "?" + query.Encode()
 	}
-	request.ContentLength = size
-	request.Header.Set("Content-Type", "application/octet-stream")
-	request.Header.Set("User-Agent", "pdo")
-	request.SetBasicAuth(client.username, client.password)
-	response, err := client.http.Do(request)
-	if err != nil {
-		return fmt.Errorf("Webdis request failed: %w", err)
-	}
-	defer response.Body.Close()
-	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 4097))
-	if err != nil {
-		return fmt.Errorf("read Webdis response: %w", err)
-	}
-	if len(responseBody) > 4096 {
-		return fmt.Errorf("Webdis response is too large")
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("Webdis returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody)))
-	}
-	if string(responseBody) != "+OK\r\n" {
-		return fmt.Errorf("invalid Webdis MSET response")
-	}
-	return nil
+	return endpoint
 }
 
-func (client *webdisClient) getPair(metadataKey, dataKey string, consume func(string, int64, io.Reader) error) error {
-	request, err := http.NewRequest(http.MethodGet, client.endpoint("MGET", metadataKey, dataKey), nil)
+func (client *cloudClipboardClient) do(method, path string, query url.Values, body io.Reader, size int64, contentType string) (*http.Response, error) {
+	request, err := http.NewRequest(method, client.endpoint(path, query), body)
 	if err != nil {
-		return fmt.Errorf("create Webdis request: %w", err)
+		return nil, fmt.Errorf("create cloud-clipboard-go request: %w", err)
+	}
+	if size >= 0 {
+		request.ContentLength = size
+	}
+	if contentType != "" {
+		request.Header.Set("Content-Type", contentType)
 	}
 	request.Header.Set("User-Agent", "pdo")
-	request.SetBasicAuth(client.username, client.password)
+	request.Header.Set("Authorization", "Bearer "+client.password)
 	response, err := client.http.Do(request)
 	if err != nil {
-		return fmt.Errorf("Webdis request failed: %w", err)
+		return nil, fmt.Errorf("cloud-clipboard-go request failed: %w", err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		defer response.Body.Close()
+		responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 4097))
+		message := strings.TrimSpace(string(responseBody))
+		if len(responseBody) > 4096 {
+			message = strings.TrimSpace(string(responseBody[:4096])) + "..."
+		}
+		if message == "" {
+			return nil, fmt.Errorf("cloud-clipboard-go returned HTTP %d", response.StatusCode)
+		}
+		return nil, fmt.Errorf("cloud-clipboard-go returned HTTP %d: %s", response.StatusCode, message)
+	}
+	return response, nil
+}
+
+func (client *cloudClipboardClient) jsonRequest(method, path string, query url.Values, body io.Reader, size int64, contentType string, limit int64, target any) error {
+	response, err := client.do(method, path, query, body, size, contentType)
+	if err != nil {
+		return err
 	}
 	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return fmt.Errorf("Webdis returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody)))
+	if response.ContentLength > limit {
+		return fmt.Errorf("cloud-clipboard-go response exceeds %d-byte limit", limit)
 	}
-
-	reader := bufio.NewReaderSize(response.Body, 4096)
-	line, err := readRESPLine(reader)
-	if err != nil || line != "*2" {
-		return fmt.Errorf("invalid Webdis MGET response")
+	limited := &io.LimitedReader{R: response.Body, N: limit + 1}
+	decoder := json.NewDecoder(limited)
+	if err := decoder.Decode(target); err != nil {
+		return fmt.Errorf("decode cloud-clipboard-go response: %w", err)
 	}
-	metadataSize, present, err := readRESPBulkLength(reader, 4096)
-	if err != nil {
-		return err
+	var trailing json.RawMessage
+	err = decoder.Decode(&trailing)
+	if limited.N == 0 {
+		return fmt.Errorf("cloud-clipboard-go response exceeds %d-byte limit", limit)
 	}
-	if !present {
-		return fmt.Errorf("cloud slot is empty")
-	}
-	metadata := make([]byte, metadataSize)
-	if _, err := io.ReadFull(reader, metadata); err != nil {
-		return fmt.Errorf("read Webdis metadata: %w", err)
-	}
-	if err := readRESPCRLF(reader); err != nil {
-		return err
-	}
-	dataSize, present, err := readRESPBulkLength(reader, maxClipboardPayload)
-	if err != nil {
-		return err
-	}
-	if !present {
-		return fmt.Errorf("cloud slot is empty")
-	}
-	limited := &io.LimitedReader{R: reader, N: dataSize}
-	if err := consume(string(metadata), dataSize, limited); err != nil {
-		return err
-	}
-	if limited.N != 0 {
-		return fmt.Errorf("Webdis payload length is shorter than declared")
-	}
-	if err := readRESPCRLF(reader); err != nil {
-		return err
-	}
-	if _, err := reader.ReadByte(); err != io.EOF {
+	if err != io.EOF {
 		if err == nil {
-			return fmt.Errorf("invalid trailing data in Webdis response")
+			return fmt.Errorf("invalid trailing data in cloud-clipboard-go response")
 		}
-		return fmt.Errorf("read Webdis response: %w", err)
+		return fmt.Errorf("decode cloud-clipboard-go response: %w", err)
 	}
 	return nil
 }
 
-func (client *webdisClient) endpoint(command string, arguments ...string) string {
-	parts := make([]string, 1, len(arguments)+1)
-	parts[0] = command
-	for _, argument := range arguments {
-		parts = append(parts, url.PathEscape(argument))
+func (client *cloudClipboardClient) postText(data []byte) error {
+	var result struct {
+		ID   string `json:"id"`
+		Type string `json:"type"`
 	}
-	return client.host + "/" + strings.Join(parts, "/") + ".raw"
-}
-
-func readRESPLine(reader *bufio.Reader) (string, error) {
-	line, err := reader.ReadSlice('\n')
+	err := client.jsonRequest(http.MethodPost, "text", url.Values{"room": {client.clipboardRoom}}, bytes.NewReader(data), int64(len(data)), "text/plain", maxCloudControlResponse, &result)
 	if err != nil {
-		return "", fmt.Errorf("read Webdis RESP line: %w", err)
+		return err
 	}
-	if len(line) < 2 || line[len(line)-2] != '\r' {
-		return "", fmt.Errorf("invalid Webdis RESP line")
-	}
-	return string(line[:len(line)-2]), nil
-}
-
-func readRESPBulkLength(reader *bufio.Reader, limit int64) (int64, bool, error) {
-	line, err := readRESPLine(reader)
-	if err != nil {
-		return 0, false, err
-	}
-	if !strings.HasPrefix(line, "$") {
-		return 0, false, fmt.Errorf("invalid Webdis RESP bulk value")
-	}
-	size, err := strconv.ParseInt(line[1:], 10, 64)
-	if err != nil || size < -1 {
-		return 0, false, fmt.Errorf("invalid Webdis RESP bulk length")
-	}
-	if size == -1 {
-		return 0, false, nil
-	}
-	if size > limit {
-		if limit == maxClipboardPayload {
-			return 0, false, fmt.Errorf("Webdis payload exceeds 64 MiB limit")
-		}
-		return 0, false, fmt.Errorf("Webdis metadata exceeds %d-byte limit", limit)
-	}
-	return size, true, nil
-}
-
-func readRESPCRLF(reader *bufio.Reader) error {
-	var delimiter [2]byte
-	if _, err := io.ReadFull(reader, delimiter[:]); err != nil {
-		return fmt.Errorf("read Webdis RESP delimiter: %w", err)
-	}
-	if delimiter != [2]byte{'\r', '\n'} {
-		return fmt.Errorf("invalid Webdis RESP delimiter")
+	if result.ID == "" || result.Type != "text" {
+		return fmt.Errorf("invalid cloud-clipboard-go text response")
 	}
 	return nil
+}
+
+func (client *cloudClipboardClient) latest(room string, limit int64) (cloudContent, error) {
+	var content cloudContent
+	err := client.jsonRequest(http.MethodGet, "content/latest", url.Values{"json": {"true"}, "room": {room}}, nil, -1, "", limit, &content)
+	if err != nil {
+		return cloudContent{}, err
+	}
+	return content, nil
+}
+
+func (client *cloudClipboardClient) uploadFile(room, name string, reader io.Reader, size int64, progress *transferProgress) error {
+	if size < 0 || size > maxClipboardPayload {
+		return fmt.Errorf("file exceeds 64 MiB limit")
+	}
+	var created struct {
+		Result struct {
+			UUID string `json:"uuid"`
+		} `json:"result"`
+	}
+	if err := client.jsonRequest(http.MethodPost, "upload/chunk", url.Values{"room": {room}}, strings.NewReader(name), int64(len(name)), "text/plain", maxCloudControlResponse, &created); err != nil {
+		return err
+	}
+	uuid := created.Result.UUID
+	if !uuidRegexp.MatchString(uuid) {
+		return fmt.Errorf("invalid cloud-clipboard-go upload UUID %q", uuid)
+	}
+	finishing := false
+	published := false
+	defer func() {
+		if !finishing && !published {
+			client.deleteFile(room, uuid)
+		}
+	}()
+
+	buffer := make([]byte, cloudUploadChunkSize)
+	remaining := size
+	if remaining == 0 {
+		if err := client.postChunk(uuid, nil); err != nil {
+			return err
+		}
+	}
+	for remaining > 0 {
+		chunkSize := int64(len(buffer))
+		if remaining < chunkSize {
+			chunkSize = remaining
+		}
+		chunk := buffer[:int(chunkSize)]
+		if _, err := io.ReadFull(reader, chunk); err != nil {
+			return fmt.Errorf("read upload file: %w", err)
+		}
+		if err := client.postChunk(uuid, chunk); err != nil {
+			return err
+		}
+		if progress != nil {
+			progress.Write(chunk)
+		}
+		remaining -= chunkSize
+	}
+	var extra [1]byte
+	if n, err := io.ReadFull(reader, extra[:]); n != 0 {
+		return fmt.Errorf("file changed while uploading")
+	} else if err != io.EOF {
+		return fmt.Errorf("read upload file: %w", err)
+	}
+
+	finishing = true
+	var result struct {
+		ID string `json:"id"`
+	}
+	if err := client.jsonRequest(http.MethodPost, "upload/finish/"+uuid, url.Values{"room": {room}}, nil, 0, "", maxCloudControlResponse, &result); err != nil {
+		return fmt.Errorf("finish upload %s: %w; upload state may already be published", uuid, err)
+	}
+	if result.ID == "" {
+		return fmt.Errorf("finish upload %s: invalid cloud-clipboard-go response; upload state may already be published", uuid)
+	}
+	published = true
+	return nil
+}
+
+func (client *cloudClipboardClient) postChunk(uuid string, data []byte) error {
+	var result struct{}
+	return client.jsonRequest(http.MethodPost, "upload/chunk/"+uuid, nil, bytes.NewReader(data), int64(len(data)), "application/octet-stream", maxCloudControlResponse, &result)
+}
+
+func (client *cloudClipboardClient) deleteFile(room, uuid string) {
+	response, err := client.do(http.MethodDelete, "file/"+uuid, url.Values{"room": {room}}, nil, -1, "")
+	if err == nil {
+		io.Copy(io.Discard, io.LimitReader(response.Body, maxCloudControlResponse))
+		response.Body.Close()
+	}
+}
+
+func (client *cloudClipboardClient) downloadFile(room, uuid string, size int64, writer io.Writer) (int64, error) {
+	if !uuidRegexp.MatchString(uuid) {
+		return 0, fmt.Errorf("invalid cloud file UUID %q", uuid)
+	}
+	if size < 0 || size > maxClipboardPayload {
+		return 0, fmt.Errorf("cloud file exceeds 64 MiB limit")
+	}
+	response, err := client.do(http.MethodGet, "file/"+uuid, url.Values{"room": {room}}, nil, -1, "")
+	if err != nil {
+		return 0, err
+	}
+	defer response.Body.Close()
+	if response.ContentLength > maxClipboardPayload {
+		return 0, fmt.Errorf("cloud file exceeds 64 MiB limit")
+	}
+	if response.ContentLength >= 0 && response.ContentLength != size {
+		return 0, fmt.Errorf("downloaded file length is %d, expected %d", response.ContentLength, size)
+	}
+	written, err := io.Copy(writer, io.LimitReader(response.Body, size+1))
+	if err != nil {
+		return written, fmt.Errorf("download cloud file: %w", err)
+	}
+	if written != size {
+		return written, fmt.Errorf("downloaded file length is %d, expected %d", written, size)
+	}
+	return written, nil
 }
 
 func validateClipboardPayload(kind string, data []byte) (int, int, error) {

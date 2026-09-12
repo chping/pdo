@@ -12,7 +12,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -101,18 +100,16 @@ func TestLoadConfigSchemaAndUnknownSection(t *testing.T) {
 func TestCloudClipboardConfigValidation(t *testing.T) {
 	t.Setenv("PDO_CLOUD_CLIPBOARD_PASSWORD", "secret")
 	valid := config{CloudClipboard: cloudClipboardConfig{
-		Host:        "https://clipboard.example.com/",
-		Prefix:      "personal",
-		Username:    "pdo",
+		Host:        "https://clipboard.example.com/clipboard/",
+		Room:        "personal",
 		PasswordEnv: "PDO_CLOUD_CLIPBOARD_PASSWORD",
 	}}
-	if client, err := valid.prepareCloudClipboard(); err != nil || client.password != "secret" {
+	if client, err := valid.prepareCloudClipboard(); err != nil || client.password != "secret" || client.host != "https://clipboard.example.com/clipboard" || client.clipboardRoom != "personal-pdo-clipboard" || client.fileRoom != "personal-pdo-file" || client.http.CheckRedirect == nil {
 		t.Fatalf("client=%+v error=%v", client, err)
 	}
 	invalidHosts := []string{
 		"http://clipboard.example.com/",
 		"https://user@clipboard.example.com/",
-		"https://clipboard.example.com/webdis",
 		"https://clipboard.example.com/?query=1",
 		"https://clipboard.example.com/#fragment",
 	}
@@ -123,15 +120,13 @@ func TestCloudClipboardConfigValidation(t *testing.T) {
 			t.Errorf("host %q was accepted", host)
 		}
 	}
-	for _, field := range []string{"host", "prefix", "username", "password_env"} {
+	for _, field := range []string{"host", "room", "password_env"} {
 		cfg := valid
 		switch field {
 		case "host":
 			cfg.CloudClipboard.Host = ""
-		case "prefix":
-			cfg.CloudClipboard.Prefix = ""
-		case "username":
-			cfg.CloudClipboard.Username = ""
+		case "room":
+			cfg.CloudClipboard.Room = ""
 		case "password_env":
 			cfg.CloudClipboard.PasswordEnv = ""
 		}
@@ -142,6 +137,12 @@ func TestCloudClipboardConfigValidation(t *testing.T) {
 	t.Setenv("PDO_CLOUD_CLIPBOARD_PASSWORD", "")
 	if _, err := valid.prepareCloudClipboard(); err == nil || !strings.Contains(err.Error(), "is empty") {
 		t.Fatalf("empty password error=%v", err)
+	}
+	t.Setenv("PDO_CLOUD_CLIPBOARD_PASSWORD", "secret")
+	old := valid
+	old.CloudClipboard.Room = ""
+	if _, err := old.prepareCloudClipboard(); err == nil || !strings.Contains(err.Error(), "Webdis") {
+		t.Fatalf("old Webdis config error=%v", err)
 	}
 }
 
@@ -166,7 +167,7 @@ func TestCloudClipboardCommandArguments(t *testing.T) {
 }
 
 func TestCloudClipboardTextAndImageCommands(t *testing.T) {
-	fixture := newWebdisFixture(t)
+	fixture := newCloudClipboardFixture(t)
 	home := t.TempDir()
 	setHome(t, home)
 	writeCloudConfig(t, home, fixture.server.URL)
@@ -182,7 +183,7 @@ func TestCloudClipboardTextAndImageCommands(t *testing.T) {
 		return nil
 	}
 
-	text := "中文\n\"quoted\""
+	text := "中文\n\"quoted\"\x00"
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"copy", text}, &stdout, &stderr); code != 0 || stdout.Len() != 0 || stderr.Len() != 0 {
 		t.Fatalf("copy code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
@@ -205,8 +206,7 @@ func TestCloudClipboardTextAndImageCommands(t *testing.T) {
 		t.Fatalf("image paste code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 
-	fixture.set("personal:pdo:clipboard:type", []byte("image-png"))
-	fixture.set("personal:pdo:clipboard:data", []byte("not a png"))
+	fixture.setFile("personal-pdo-clipboard", "clipboard.png", []byte("not a png"))
 	writtenKind = "unchanged"
 	stdout.Reset()
 	stderr.Reset()
@@ -226,7 +226,7 @@ func TestCloudClipboardTextAndImageCommands(t *testing.T) {
 }
 
 func TestCloudClipboardFileCommands(t *testing.T) {
-	fixture := newWebdisFixture(t)
+	fixture := newCloudClipboardFixture(t)
 	home := t.TempDir()
 	setHome(t, home)
 	writeCloudConfig(t, home, fixture.server.URL)
@@ -234,11 +234,11 @@ func TestCloudClipboardFileCommands(t *testing.T) {
 
 	sourceDirectory := t.TempDir()
 	target := filepath.Join(sourceDirectory, "target.bin")
-	content := []byte{0, 1, 2, 3, 255}
+	content := bytes.Repeat([]byte{0, 1, 2, 3, 255}, cloudUploadChunkSize/5+4)
 	if err := os.WriteFile(target, content, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	source := filepath.Join(sourceDirectory, "資料 file.bin")
+	source := filepath.Join(sourceDirectory, "資料 file.txt")
 	if runtime.GOOS == "windows" {
 		if err := os.Rename(target, source); err != nil {
 			t.Fatal(err)
@@ -251,6 +251,9 @@ func TestCloudClipboardFileCommands(t *testing.T) {
 	if code := run([]string{"copy-file", source}, &stdout, &stderr); code != 0 || stdout.Len() != 0 || stderr.Len() != 0 {
 		t.Fatalf("copy-file code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
+	if got := fixture.uploadChunkSizes(); len(got) != 2 || got[0] != cloudUploadChunkSize || got[1] != len(content)-cloudUploadChunkSize {
+		t.Fatalf("upload chunks=%v", got)
+	}
 	destination := t.TempDir()
 	existing := filepath.Join(destination, filepath.Base(source))
 	if err := os.WriteFile(existing, []byte("existing"), 0o600); err != nil {
@@ -260,7 +263,7 @@ func TestCloudClipboardFileCommands(t *testing.T) {
 	if code := run([]string{"paste-file", destination}, &stdout, &stderr); code != 0 || stderr.Len() != 0 {
 		t.Fatalf("paste-file code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
-	first := filepath.Join(destination, "資料 file (1).bin")
+	first := filepath.Join(destination, "資料 file (1).txt")
 	if stdout.String() != first+"\n" {
 		t.Fatalf("saved path=%q want=%q", stdout.String(), first+"\n")
 	}
@@ -272,7 +275,7 @@ func TestCloudClipboardFileCommands(t *testing.T) {
 	if code := run([]string{"paste-file", destination}, &stdout, &stderr); code != 0 {
 		t.Fatalf("second paste-file code=%d stderr=%q", code, stderr.String())
 	}
-	second := filepath.Join(destination, "資料 file (2).bin")
+	second := filepath.Join(destination, "資料 file (2).txt")
 	assertFileContent(t, second, content)
 
 	empty := filepath.Join(sourceDirectory, "empty.bin")
@@ -283,6 +286,10 @@ func TestCloudClipboardFileCommands(t *testing.T) {
 	stderr.Reset()
 	if code := run([]string{"copy-file", empty}, &stdout, &stderr); code != 0 {
 		t.Fatalf("empty copy-file code=%d stderr=%q", code, stderr.String())
+	}
+	chunks := fixture.uploadChunkSizes()
+	if chunks[len(chunks)-1] != 0 {
+		t.Fatalf("empty upload chunks=%v", chunks)
 	}
 	if code := run([]string{"paste-file", destination}, &stdout, &stderr); code != 0 {
 		t.Fatalf("empty paste-file code=%d stderr=%q", code, stderr.String())
@@ -301,11 +308,40 @@ func TestCloudClipboardFileCommands(t *testing.T) {
 	}
 	assertFileContent(t, filepath.Join(defaultDirectory, "empty.bin"), nil)
 
-	fixture.set("personal:pdo:file:name", []byte("../escape"))
+	fixture.setFile("personal-pdo-file", "../escape", []byte("bad"))
 	stdout.Reset()
 	stderr.Reset()
 	if code := run([]string{"paste-file", destination}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "invalid remote file name") {
 		t.Fatalf("invalid name code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+
+	size := int64(3)
+	fixture.mutex.Lock()
+	fixture.rooms["personal-pdo-file"] = cloudContent{Type: "file", Name: "invalid-uuid.bin", Size: &size, UUID: "../escape"}
+	fixture.mutex.Unlock()
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"paste-file", destination}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "invalid cloud file UUID") {
+		t.Fatalf("invalid UUID code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(destination, "invalid-uuid.bin")); !os.IsNotExist(err) {
+		t.Fatalf("invalid UUID left destination file: %v", err)
+	}
+
+	fixture.setFile("personal-pdo-file", "mismatch.bin", []byte("abc"))
+	fixture.mutex.Lock()
+	mismatch := fixture.rooms["personal-pdo-file"]
+	wrongSize := int64(4)
+	mismatch.Size = &wrongSize
+	fixture.rooms["personal-pdo-file"] = mismatch
+	fixture.mutex.Unlock()
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"paste-file", destination}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "length") {
+		t.Fatalf("length mismatch code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(destination, "mismatch.bin")); !os.IsNotExist(err) {
+		t.Fatalf("length mismatch left destination file: %v", err)
 	}
 
 	large := filepath.Join(sourceDirectory, "large.bin")
@@ -327,19 +363,16 @@ func TestCloudClipboardFileCommands(t *testing.T) {
 	}
 }
 
-func TestWebdisRESPValidationAndProgress(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		io.WriteString(writer, "*2\r\n$4\r\ntext\r\n$67108865\r\n")
+func TestCloudClipboardResponseValidationAndProgress(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		io.WriteString(writer, `{"type":"text","content":"too large"}`)
 	}))
 	defer server.Close()
-	client := webdisClient{http: server.Client(), host: server.URL, username: "pdo", password: "secret"}
-	called := false
-	err := client.getPair("type", "data", func(string, int64, io.Reader) error {
-		called = true
-		return nil
-	})
-	if err == nil || !strings.Contains(err.Error(), "64 MiB") || called {
-		t.Fatalf("oversized RESP error=%v called=%v", err, called)
+	client := cloudClipboardClient{http: server.Client(), host: server.URL, password: "secret"}
+	var content cloudContent
+	err := client.jsonRequest(http.MethodGet, "content/latest", nil, nil, -1, "", 16, &content)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized response error=%v", err)
 	}
 
 	var output bytes.Buffer
@@ -350,6 +383,87 @@ func TestWebdisRESPValidationAndProgress(t *testing.T) {
 	progress.finish()
 	if !strings.Contains(output.String(), "100.00%") || !strings.Contains(output.String(), "4 B/4 B") || !strings.HasSuffix(output.String(), "\n") {
 		t.Fatalf("progress=%q", output.String())
+	}
+}
+
+func TestCloudClipboardPayloadLimitAndTrailingJSON(t *testing.T) {
+	payload := make([]byte, maxClipboardPayload+1)
+	if _, _, err := validateClipboardPayload("text", payload[:maxClipboardPayload]); err != nil {
+		t.Fatalf("64 MiB payload rejected: %v", err)
+	}
+	if _, _, err := validateClipboardPayload("text", payload); err == nil || !strings.Contains(err.Error(), "64 MiB") {
+		t.Fatalf("oversized payload error=%v", err)
+	}
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		io.WriteString(writer, `{} {}`)
+	}))
+	defer server.Close()
+	client := cloudClipboardClient{http: server.Client(), host: server.URL, password: "secret"}
+	var content cloudContent
+	if err := client.jsonRequest(http.MethodGet, "content/latest", nil, nil, -1, "", maxCloudControlResponse, &content); err == nil || !strings.Contains(err.Error(), "trailing") {
+		t.Fatalf("trailing JSON error=%v", err)
+	}
+}
+
+func TestCloudClipboardUploadFailureCleanup(t *testing.T) {
+	fixture := newCloudClipboardFixture(t)
+	client := cloudClipboardClient{http: fixture.server.Client(), host: fixture.server.URL + "/api", password: "secret"}
+
+	fixture.mutex.Lock()
+	fixture.failChunk = true
+	fixture.mutex.Unlock()
+	if err := client.uploadFile("room", "chunk.bin", strings.NewReader("data"), 4, nil); err == nil || !strings.Contains(err.Error(), "HTTP 500") {
+		t.Fatalf("chunk failure error=%v", err)
+	}
+	fixture.mutex.Lock()
+	deleted := fixture.deleted
+	fixture.failChunk = false
+	fixture.failFinish = true
+	fixture.mutex.Unlock()
+	if deleted != 1 {
+		t.Fatalf("chunk failure cleanup count=%d", deleted)
+	}
+	if err := client.uploadFile("room", "finish.bin", strings.NewReader("data"), 4, nil); err == nil || !strings.Contains(err.Error(), "may already be published") {
+		t.Fatalf("finish failure error=%v", err)
+	}
+	fixture.mutex.Lock()
+	deleted, finishRequests := fixture.deleted, fixture.finishRequests
+	fixture.mutex.Unlock()
+	if deleted != 1 || finishRequests != 1 {
+		t.Fatalf("finish failure deleted=%d requests=%d", deleted, finishRequests)
+	}
+}
+
+func TestCloudClipboardDoesNotFollowRedirects(t *testing.T) {
+	var mutex sync.Mutex
+	hits := 0
+	destination := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		mutex.Lock()
+		hits++
+		mutex.Unlock()
+	}))
+	defer destination.Close()
+	redirect := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Redirect(writer, request, destination.URL, http.StatusTemporaryRedirect)
+	}))
+	defer redirect.Close()
+
+	previous := cloudHTTPClient
+	cloudHTTPClient = func() *http.Client { return redirect.Client() }
+	t.Cleanup(func() { cloudHTTPClient = previous })
+	t.Setenv("PDO_CLOUD_CLIPBOARD_PASSWORD", "secret")
+	client, err := (config{CloudClipboard: cloudClipboardConfig{Host: redirect.URL, Room: "room", PasswordEnv: "PDO_CLOUD_CLIPBOARD_PASSWORD"}}).prepareCloudClipboard()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.postText([]byte("text")); err == nil || !strings.Contains(err.Error(), "HTTP 307") {
+		t.Fatalf("redirect error=%v", err)
+	}
+	mutex.Lock()
+	defer mutex.Unlock()
+	if hits != 0 {
+		t.Fatalf("redirect destination hits=%d", hits)
 	}
 }
 
@@ -1522,40 +1636,43 @@ func assertMode(t *testing.T, path string, want os.FileMode) {
 	}
 }
 
-type webdisFixture struct {
-	server *httptest.Server
-	mutex  sync.Mutex
-	values map[string][]byte
+type cloudClipboardFixture struct {
+	server         *httptest.Server
+	mutex          sync.Mutex
+	next           int
+	rooms          map[string]cloudContent
+	files          map[string][]byte
+	uploads        map[string]*cloudUploadFixture
+	chunkSizes     []int
+	deleted        int
+	finishRequests int
+	failChunk      bool
+	failFinish     bool
 }
 
-func newWebdisFixture(t *testing.T) *webdisFixture {
+type cloudUploadFixture struct {
+	room string
+	name string
+	data []byte
+}
+
+func newCloudClipboardFixture(t *testing.T) *cloudClipboardFixture {
 	t.Helper()
-	fixture := &webdisFixture{values: make(map[string][]byte)}
+	fixture := &cloudClipboardFixture{
+		rooms:   make(map[string]cloudContent),
+		files:   make(map[string][]byte),
+		uploads: make(map[string]*cloudUploadFixture),
+	}
 	fixture.server = httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		username, password, ok := request.BasicAuth()
-		if !ok || username != "pdo" || password != "secret" {
+		if request.Header.Get("Authorization") != "Bearer secret" {
 			http.Error(writer, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		escapedPath := strings.TrimPrefix(request.URL.EscapedPath(), "/")
-		parts := strings.Split(escapedPath, "/")
-		if len(parts) == 0 {
-			http.Error(writer, "bad request", http.StatusBadRequest)
-			return
-		}
-		parts[len(parts)-1] = strings.TrimSuffix(parts[len(parts)-1], ".raw")
-		for index := range parts {
-			decoded, err := url.PathUnescape(parts[index])
-			if err != nil {
-				http.Error(writer, "bad escape", http.StatusBadRequest)
-				return
-			}
-			parts[index] = decoded
-		}
-		switch parts[0] {
-		case "MSET":
-			if request.Method != http.MethodPut || len(parts) != 4 {
-				http.Error(writer, "bad MSET", http.StatusBadRequest)
+		path := strings.TrimPrefix(request.URL.Path, "/api")
+		switch {
+		case path == "/text" && request.Method == http.MethodPost:
+			if request.Header.Get("Content-Type") != "text/plain" {
+				http.Error(writer, "bad content type", http.StatusBadRequest)
 				return
 			}
 			data, err := io.ReadAll(request.Body)
@@ -1563,50 +1680,157 @@ func newWebdisFixture(t *testing.T) *webdisFixture {
 				http.Error(writer, err.Error(), http.StatusBadRequest)
 				return
 			}
+			room := request.URL.Query().Get("room")
+			content := string(data)
 			fixture.mutex.Lock()
-			fixture.values[parts[1]] = []byte(parts[2])
-			fixture.values[parts[3]] = data
+			fixture.next++
+			id := fmt.Sprint(fixture.next)
+			fixture.rooms[room] = cloudContent{Type: "text", Content: &content}
 			fixture.mutex.Unlock()
-			io.WriteString(writer, "+OK\r\n")
-		case "MGET":
-			if request.Method != http.MethodGet || len(parts) != 3 {
-				http.Error(writer, "bad MGET", http.StatusBadRequest)
+			writeJSON(writer, map[string]string{"id": id, "type": "text", "url": "https://untrusted.example/content/" + id})
+
+		case path == "/upload/chunk" && request.Method == http.MethodPost:
+			if request.Header.Get("Content-Type") != "text/plain" {
+				http.Error(writer, "bad content type", http.StatusBadRequest)
+				return
+			}
+			name, err := io.ReadAll(request.Body)
+			if err != nil {
+				http.Error(writer, err.Error(), http.StatusBadRequest)
 				return
 			}
 			fixture.mutex.Lock()
-			values := [][]byte{
-				append([]byte(nil), fixture.values[parts[1]]...),
-				append([]byte(nil), fixture.values[parts[2]]...),
-			}
-			_, firstPresent := fixture.values[parts[1]]
-			_, secondPresent := fixture.values[parts[2]]
+			fixture.next++
+			uuid := fmt.Sprintf("00000000-0000-4000-8000-%012x", fixture.next)
+			fixture.uploads[uuid] = &cloudUploadFixture{room: request.URL.Query().Get("room"), name: string(name)}
 			fixture.mutex.Unlock()
-			io.WriteString(writer, "*2\r\n")
-			for index, value := range values {
-				present := firstPresent
-				if index == 1 {
-					present = secondPresent
-				}
-				if !present {
-					io.WriteString(writer, "$-1\r\n")
-					continue
-				}
-				fmt.Fprintf(writer, "$%d\r\n", len(value))
-				writer.Write(value)
-				io.WriteString(writer, "\r\n")
+			writeJSON(writer, map[string]any{"result": map[string]string{"uuid": uuid}})
+
+		case strings.HasPrefix(path, "/upload/chunk/") && request.Method == http.MethodPost:
+			data, err := io.ReadAll(request.Body)
+			if err != nil {
+				http.Error(writer, err.Error(), http.StatusBadRequest)
+				return
 			}
+			uuid := strings.TrimPrefix(path, "/upload/chunk/")
+			fixture.mutex.Lock()
+			upload := fixture.uploads[uuid]
+			fail := fixture.failChunk
+			if upload != nil && !fail {
+				upload.data = append(upload.data, data...)
+				fixture.chunkSizes = append(fixture.chunkSizes, len(data))
+			}
+			fixture.mutex.Unlock()
+			if fail {
+				http.Error(writer, "chunk failed", http.StatusInternalServerError)
+				return
+			}
+			if upload == nil {
+				http.Error(writer, "unknown upload", http.StatusBadRequest)
+				return
+			}
+			writeJSON(writer, map[string]any{})
+
+		case strings.HasPrefix(path, "/upload/finish/") && request.Method == http.MethodPost:
+			uuid := strings.TrimPrefix(path, "/upload/finish/")
+			fixture.mutex.Lock()
+			fixture.finishRequests++
+			upload := fixture.uploads[uuid]
+			fail := fixture.failFinish
+			if upload != nil && !fail {
+				size := int64(len(upload.data))
+				kind := "file"
+				if strings.HasSuffix(strings.ToLower(upload.name), ".png") {
+					kind = "image"
+				} else if strings.HasSuffix(strings.ToLower(upload.name), ".txt") {
+					kind = "text"
+				}
+				fixture.files[uuid] = append([]byte(nil), upload.data...)
+				fixture.rooms[upload.room] = cloudContent{Type: kind, Name: upload.name, Size: &size, UUID: uuid}
+				fixture.next++
+			}
+			id := fmt.Sprint(fixture.next)
+			fixture.mutex.Unlock()
+			if fail {
+				http.Error(writer, "finish failed", http.StatusInternalServerError)
+				return
+			}
+			if upload == nil || request.URL.Query().Get("room") != upload.room {
+				http.Error(writer, "unknown upload", http.StatusBadRequest)
+				return
+			}
+			writeJSON(writer, map[string]string{"id": id, "type": "file", "url": "https://untrusted.example/content/" + id})
+
+		case path == "/content/latest" && request.Method == http.MethodGet:
+			if request.URL.Query().Get("json") != "true" {
+				http.Error(writer, "json required", http.StatusBadRequest)
+				return
+			}
+			fixture.mutex.Lock()
+			content, ok := fixture.rooms[request.URL.Query().Get("room")]
+			fixture.mutex.Unlock()
+			if !ok {
+				http.Error(writer, "not found", http.StatusNotFound)
+				return
+			}
+			if content.UUID != "" {
+				writeJSON(writer, map[string]any{
+					"type": content.Type, "name": content.Name, "size": content.Size,
+					"uuid": content.UUID, "url": "https://untrusted.example/file",
+				})
+			} else {
+				writeJSON(writer, content)
+			}
+
+		case strings.HasPrefix(path, "/file/") && request.Method == http.MethodGet:
+			uuid := strings.TrimPrefix(path, "/file/")
+			fixture.mutex.Lock()
+			data, ok := fixture.files[uuid]
+			data = append([]byte(nil), data...)
+			fixture.mutex.Unlock()
+			if !ok {
+				http.Error(writer, "not found", http.StatusNotFound)
+				return
+			}
+			writer.Header().Set("Content-Length", fmt.Sprint(len(data)))
+			writer.Write(data)
+
+		case strings.HasPrefix(path, "/file/") && request.Method == http.MethodDelete:
+			uuid := strings.TrimPrefix(path, "/file/")
+			fixture.mutex.Lock()
+			delete(fixture.files, uuid)
+			delete(fixture.uploads, uuid)
+			fixture.deleted++
+			fixture.mutex.Unlock()
+			writeJSON(writer, map[string]string{"status": "deleted"})
+
 		default:
-			http.Error(writer, "unknown command", http.StatusBadRequest)
+			http.Error(writer, "unknown request", http.StatusBadRequest)
 		}
 	}))
 	t.Cleanup(fixture.server.Close)
 	return fixture
 }
 
-func (fixture *webdisFixture) set(key string, value []byte) {
+func (fixture *cloudClipboardFixture) setFile(room, name string, data []byte) {
 	fixture.mutex.Lock()
-	fixture.values[key] = append([]byte(nil), value...)
-	fixture.mutex.Unlock()
+	defer fixture.mutex.Unlock()
+	fixture.next++
+	uuid := fmt.Sprintf("00000000-0000-4000-8000-%012x", fixture.next)
+	size := int64(len(data))
+	fixture.files[uuid] = append([]byte(nil), data...)
+	fixture.rooms[room] = cloudContent{Type: "file", Name: name, Size: &size, UUID: uuid}
+}
+
+func (fixture *cloudClipboardFixture) uploadChunkSizes() []int {
+	fixture.mutex.Lock()
+	defer fixture.mutex.Unlock()
+	return append([]int(nil), fixture.chunkSizes...)
+}
+
+func writeJSON(writer http.ResponseWriter, value any) {
+	writer.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(writer).Encode(value)
 }
 
 func setCloudServer(t *testing.T, server *httptest.Server) {
@@ -1626,9 +1850,8 @@ func writeCloudConfig(t *testing.T, home, host string) {
 	data, err := json.Marshal(config{
 		SchemaVersion: 1,
 		CloudClipboard: cloudClipboardConfig{
-			Host:        host,
-			Prefix:      "personal",
-			Username:    "pdo",
+			Host:        strings.TrimRight(host, "/") + "/api/",
+			Room:        "personal",
 			PasswordEnv: "PDO_CLOUD_CLIPBOARD_PASSWORD",
 		},
 	})
