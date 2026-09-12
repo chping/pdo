@@ -79,8 +79,12 @@ try {
     Write-Host "Installed pdo to $pdoInstallDir\pdo.exe"
     $pdoUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
     if (($pdoUserPath -split ";") -notcontains $pdoInstallDir) {
-        Write-Warning "$pdoInstallDir is not in PATH. Add it with:"
-        Write-Host "[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';$pdoInstallDir', 'User')"
+        $pdoUserPath = if ([string]::IsNullOrEmpty($pdoUserPath)) { $pdoInstallDir } else { "$pdoUserPath;$pdoInstallDir" }
+        [Environment]::SetEnvironmentVariable("Path", $pdoUserPath, "User")
+        Write-Host "Added $pdoInstallDir to the user PATH."
+    }
+    if (($env:Path -split ";") -notcontains $pdoInstallDir) {
+        $env:Path = if ([string]::IsNullOrEmpty($env:Path)) { $pdoInstallDir } else { "$env:Path;$pdoInstallDir" }
     }
     $pdoRunSetup = $false
     if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {

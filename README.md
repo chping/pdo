@@ -16,7 +16,7 @@ Windows PowerShell：
 irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
 ```
 
-安装器会识别 `amd64` / `arm64`、验证 SHA-256，并在交互终端询问是否立即运行 `pdo setup`。选择否（或没有交互终端）时，仅在配置不存在时创建模板。它不会修改 PATH 或覆盖已有配置。
+安装器会识别 `amd64` / `arm64`、验证 SHA-256，并在交互终端询问是否立即运行 `pdo setup`。选择否（或没有交互终端）时，仅在配置不存在时创建模板。Windows 安装器会将安装目录加入用户 PATH（当前 PowerShell 立即可用）；macOS / Linux 不修改 PATH，也不会覆盖已有配置。
 
 - macOS / Linux：`~/.local/bin/pdo`
 - Windows：`%LOCALAPPDATA%\Programs\pdo\pdo.exe`
