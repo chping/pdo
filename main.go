@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"image/png"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -35,6 +36,7 @@ const (
 	maxCloudTextResponse    = 6*maxClipboardPayload + maxCloudControlResponse
 	cloudUploadChunkSize    = 1 << 20
 	maxSetupInputLength     = 8192
+	networkResponseTimeout  = 10 * time.Second
 	automaticUpdateInterval = 24 * time.Hour
 	automaticUpdateTimeout  = 3 * time.Second
 	pdoEnvFileName          = ".env"
@@ -79,7 +81,7 @@ var (
 	writeClipboard    = systemClipboardWrite
 	checkDependencies = ensureDependencies
 	cloudHTTPClient   = func() *http.Client {
-		return &http.Client{Timeout: 10 * time.Minute}
+		return newHTTPClient(10*time.Minute, networkResponseTimeout)
 	}
 	setupInput      = os.Stdin
 	isSetupTerminal = func(input *os.File) bool {
@@ -392,7 +394,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	token := os.Getenv(cfg.GitHub.PATEnv)
 	if token == "" {
-		fmt.Fprintf(stderr, "pdo: environment variable %s is empty\n", cfg.GitHub.PATEnv)
+		fmt.Fprintf(stderr, "pdo: environment variable %s is empty; run 'pdo setup' or set it before retrying\n", cfg.GitHub.PATEnv)
 		return 1
 	}
 
@@ -400,7 +402,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	for _, name := range selectors {
 		item := prepared[name]
 		client := githubClient{
-			http:       &http.Client{Timeout: 30 * time.Second},
+			http:       newHTTPClient(30*time.Second, networkResponseTimeout),
 			token:      token,
 			repository: item.repository,
 			branch:     item.branch,
@@ -630,7 +632,7 @@ func (cfg config) prepareCloudClipboard() (*cloudClipboardClient, error) {
 	}
 	password := os.Getenv(item.PasswordEnv)
 	if password == "" {
-		return nil, fmt.Errorf("environment variable %s is empty", item.PasswordEnv)
+		return nil, fmt.Errorf("environment variable %s is empty; run 'pdo setup' or set it before retrying", item.PasswordEnv)
 	}
 	httpClient := cloudHTTPClient()
 	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
@@ -641,6 +643,14 @@ func (cfg config) prepareCloudClipboard() (*cloudClipboardClient, error) {
 		clipboardRoom: room + "-pdo-clipboard",
 		fileRoom:      room + "-pdo-file",
 	}, nil
+}
+
+func newHTTPClient(timeout, responseTimeout time.Duration) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{Timeout: responseTimeout, KeepAlive: 30 * time.Second}).DialContext
+	transport.TLSHandshakeTimeout = responseTimeout
+	transport.ResponseHeaderTimeout = responseTimeout
+	return &http.Client{Transport: transport, Timeout: timeout}
 }
 
 func (client *cloudClipboardClient) endpoint(path string, query url.Values) string {
@@ -2658,7 +2668,7 @@ func newUpdater(timeout time.Duration) (updater, error) {
 		return updater{}, fmt.Errorf("find executable: %w", err)
 	}
 	return updater{
-		http:         &http.Client{Timeout: timeout},
+		http:         newHTTPClient(timeout, networkResponseTimeout),
 		apiBase:      releaseAPIBase,
 		downloadBase: releaseDownloadBase,
 		version:      version,

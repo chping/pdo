@@ -367,6 +367,57 @@ func TestCloudClipboardConfigValidation(t *testing.T) {
 	}
 }
 
+func TestCloudCommandsRejectMissingPasswordBeforeNetwork(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	writeCloudConfig(t, home, "https://clipboard.example.com")
+	t.Setenv(clipboardPasswordEnv, "")
+	previous := cloudHTTPClient
+	cloudHTTPClient = func() *http.Client {
+		t.Fatal("missing password reached the network client")
+		return nil
+	}
+	t.Cleanup(func() { cloudHTTPClient = previous })
+
+	for _, args := range [][]string{{"copy", "text"}, {"paste"}, {"copy-file", "missing"}, {"paste-file"}} {
+		var stdout, stderr bytes.Buffer
+		if code := run(args, &stdout, &stderr); code != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "run 'pdo setup'") {
+			t.Fatalf("args=%v code=%d stdout=%q stderr=%q", args, code, stdout.String(), stderr.String())
+		}
+	}
+}
+
+func TestHTTPClientsLimitSilentWait(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	defer server.Close()
+	defer close(release)
+	client := newHTTPClient(time.Minute, 50*time.Millisecond)
+	started := time.Now()
+	if _, err := client.Get(server.URL); err == nil || time.Since(started) > time.Second {
+		t.Fatalf("error=%v elapsed=%s", err, time.Since(started))
+	}
+}
+
+func TestDotfileCommandsRejectMissingPATBeforeNetwork(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	t.Setenv(githubPATEnvName, "")
+	writeConfig(t, home, map[string]dotfileConfig{
+		"ssh-config": {Remote: remoteURL("ssh/config"), Local: "~/.ssh/config"},
+	})
+	previous := githubAPIBase
+	githubAPIBase = "http://127.0.0.1:1"
+	t.Cleanup(func() { githubAPIBase = previous })
+
+	for _, command := range []string{"download", "upload"} {
+		var stdout, stderr bytes.Buffer
+		if code := run([]string{command, "dotfiles"}, &stdout, &stderr); code != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "run 'pdo setup'") {
+			t.Fatalf("command=%s code=%d stdout=%q stderr=%q", command, code, stdout.String(), stderr.String())
+		}
+	}
+}
+
 func TestCloudClipboardCommandArguments(t *testing.T) {
 	invalid := [][]string{
 		{"copy", "one", "two"},

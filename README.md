@@ -106,6 +106,8 @@ OpenSSH 和系统剪贴板组件是功能级可选依赖。缺失时安装器会
 
 `cloud_clipboard` 段是可选的，只在调用四个跨设备命令时校验。反向代理必须允许至少 64 MiB 请求体，读写超时应不少于 600 秒。
 
+连接、TLS 握手或等待服务响应头超过 10 秒时，命令会返回错误；文件传输仍允许最长 10 分钟。缺少密码时会直接提示运行 `pdo setup`。
+
 内容由自管的 cloud-clipboard-go 保存，不提供端到端加密。
 
 dotfile 名称使用 kebab-case，并对应命令行的 `--<名称>`。`remote` 使用 GitHub 文件页面的标准链接 `https://github.com/OWNER/REPOSITORY/blob/BRANCH/PATH`；`local` 必须以 `~/` 开头或使用当前平台的绝对路径。pdo 会在内部将文件链接转换为 GitHub Contents API 请求。
