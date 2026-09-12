@@ -21,11 +21,13 @@ irm https://github.com/chping/pdo/releases/latest/download/install.ps1 | iex
 - macOS / Linux：`~/.local/bin/pdo`
 - Windows：`%LOCALAPPDATA%\Programs\pdo\pdo.exe`
 - 所有平台配置：`~/.config/pdo/config.json`
-- 私有凭据：`~/.config/pdo/env.json`（仅 `pdo` 自动加载）
+- 私有凭据：`~/.config/pdo/.env`（仅 `pdo` 自动加载）
 
 ## 配置
 
-推荐在终端运行 `pdo setup`。它会隐藏输入 GitHub PAT 和剪贴板密码，引导填写 SSH config 的 GitHub 文件链接及可选剪贴板服务，并将凭据写入 `~/.config/pdo/env.json`（Unix 上权限为 `0600`）。`pdo` 会自动加载该文件；不会修改启动它的 shell 配置，且当前 shell 中已设置的同名环境变量优先。
+推荐在终端运行 `pdo setup`。它会隐藏输入 GitHub PAT 和剪贴板密码，引导填写 SSH config 的 GitHub 文件链接及可选剪贴板服务，并将凭据写入 `~/.config/pdo/.env`（Unix 上权限为 `0600`）。该文件使用普通 `KEY=value` 格式，`pdo` 会自动加载；不会修改启动它的 shell 配置，且当前 shell 中已设置的同名环境变量优先。
+
+旧版 `env.json` 在 `.env` 不存在时仍会被读取；下次运行 `pdo setup` 会写入新的 `.env`。
 
 也可以手工编辑配置：
 

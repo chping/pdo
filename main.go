@@ -34,7 +34,8 @@ const (
 	maxCloudTextResponse    = 6*maxClipboardPayload + maxCloudControlResponse
 	cloudUploadChunkSize    = 1 << 20
 	maxSetupInputLength     = 8192
-	pdoEnvFileName          = "env.json"
+	pdoEnvFileName          = ".env"
+	legacyPDOEnvFileName    = "env.json"
 	githubPATEnvName        = "PDO_GITHUB_PAT"
 	clipboardPasswordEnv    = "PDO_CLOUD_CLIPBOARD_PASSWORD"
 	defaultClipboardRoom    = "personal"
@@ -58,6 +59,7 @@ var (
 	releaseAPIBase       = "https://api.github.com/repos/chping/pdo"
 	releaseDownloadBase  = "https://github.com/chping/pdo/releases/download"
 	dotfileNameRegexp    = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+	envNameRegexp        = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	versionRegexp        = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 	uuidRegexp           = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 	configMigrationSteps = map[int]jsonMigration{}
@@ -1624,8 +1626,7 @@ func runSetup(stdout, stderr io.Writer) error {
 		document["schema_version"] = json.RawMessage(strconv.Itoa(supportedSchemaVersion))
 	}
 
-	envPath := filepath.Join(home, ".config", "pdo", pdoEnvFileName)
-	environment, envTarget, err := readPDOEnv(envPath)
+	environment, envTarget, err := readPDOEnv(home)
 	if err != nil {
 		return err
 	}
@@ -1764,11 +1765,11 @@ func runSetup(stdout, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("encode config: %w", err)
 	}
-	envData, err := json.MarshalIndent(environment, "", "  ")
+	envData, err := formatPDOEnv(environment)
 	if err != nil {
 		return fmt.Errorf("encode pdo environment: %w", err)
 	}
-	if err := atomicWriteFile(envTarget, append(envData, '\n'), 0o600); err != nil {
+	if err := atomicWriteFile(envTarget, envData, 0o600); err != nil {
 		return fmt.Errorf("write pdo environment: %w", err)
 	}
 	if err := atomicWriteFile(configTarget, append(configData, '\n'), configMode); err != nil {
@@ -1800,24 +1801,81 @@ func readSetupDocument(path, label string) (map[string]json.RawMessage, string, 
 	return document, target, info.Mode().Perm(), nil
 }
 
-func readPDOEnv(path string) (map[string]string, string, error) {
-	document, target, _, err := readSetupDocument(path, "pdo environment")
+func readPDOEnv(home string) (map[string]string, string, error) {
+	path := filepath.Join(home, ".config", "pdo", pdoEnvFileName)
+	target, info, err := inspectLocalFile(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("inspect pdo environment: %w", err)
+	}
+	if info == nil {
+		environment, err := readLegacyPDOEnv(home)
+		return environment, target, err
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		return nil, "", fmt.Errorf("read pdo environment: %w", err)
+	}
+	environment, err := parsePDOEnv(data)
 	if err != nil {
 		return nil, "", err
+	}
+	return environment, target, nil
+}
+
+func readLegacyPDOEnv(home string) (map[string]string, error) {
+	document, _, _, err := readSetupDocument(filepath.Join(home, ".config", "pdo", legacyPDOEnvFileName), "legacy pdo environment")
+	if err != nil {
+		return nil, err
 	}
 	environment := make(map[string]string, len(document))
 	for name, raw := range document {
 		var value string
 		if err := json.Unmarshal(raw, &value); err != nil {
-			return nil, "", fmt.Errorf("parse pdo environment %s: %w", name, err)
+			return nil, fmt.Errorf("parse legacy pdo environment %s: %w", name, err)
 		}
 		environment[name] = value
 	}
-	return environment, target, nil
+	return environment, nil
+}
+
+func parsePDOEnv(data []byte) (map[string]string, error) {
+	environment := make(map[string]string)
+	for lineNumber, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimPrefix(line, "export ")
+		}
+		name, value, ok := strings.Cut(line, "=")
+		name = strings.TrimSpace(name)
+		if !ok || !envNameRegexp.MatchString(name) || strings.ContainsRune(value, 0) {
+			return nil, fmt.Errorf("parse pdo environment line %d", lineNumber+1)
+		}
+		environment[name] = value
+	}
+	return environment, nil
+}
+
+func formatPDOEnv(environment map[string]string) ([]byte, error) {
+	names := make([]string, 0, len(environment))
+	for name, value := range environment {
+		if !envNameRegexp.MatchString(name) || strings.ContainsAny(value, "\x00\r\n") {
+			return nil, fmt.Errorf("invalid environment variable %s", name)
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var data strings.Builder
+	for _, name := range names {
+		fmt.Fprintf(&data, "%s=%s\n", name, environment[name])
+	}
+	return []byte(data.String()), nil
 }
 
 func loadPDOEnv(home string) error {
-	environment, _, err := readPDOEnv(filepath.Join(home, ".config", "pdo", pdoEnvFileName))
+	environment, _, err := readPDOEnv(home)
 	if err != nil {
 		return err
 	}

@@ -97,6 +97,34 @@ func TestLoadConfigSchemaAndUnknownSection(t *testing.T) {
 	}
 }
 
+func TestPDOEnvFormat(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".config", "pdo", pdoEnvFileName)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("# pdo credentials\nPDO_GITHUB_PAT=token=with#characters\nexport OTHER=value\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	environment, _, err := readPDOEnv(home)
+	if err != nil || environment[githubPATEnvName] != "token=with#characters" || environment["OTHER"] != "value" {
+		t.Fatalf("environment=%v error=%v", environment, err)
+	}
+
+	legacyHome := t.TempDir()
+	legacyPath := filepath.Join(legacyHome, ".config", "pdo", legacyPDOEnvFileName)
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, []byte(`{"PDO_GITHUB_PAT":"legacy-token"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	environment, target, err := readPDOEnv(legacyHome)
+	if err != nil || environment[githubPATEnvName] != "legacy-token" || target != filepath.Join(legacyHome, ".config", "pdo", pdoEnvFileName) {
+		t.Fatalf("legacy environment=%v target=%q error=%v", environment, target, err)
+	}
+}
+
 func TestSetupWritesConfigAndPrivateEnvironment(t *testing.T) {
 	home := t.TempDir()
 	setHome(t, home)
@@ -128,12 +156,16 @@ func TestSetupWritesConfigAndPrivateEnvironment(t *testing.T) {
 		t.Fatalf("schema_version=%s", document["schema_version"])
 	}
 	envPath := filepath.Join(home, ".config", "pdo", pdoEnvFileName)
-	environment, _, err := readPDOEnv(envPath)
+	environment, _, err := readPDOEnv(home)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if environment[githubPATEnvName] != "github-secret-value" || environment[clipboardPasswordEnv] != "clipboard-secret-value" {
 		t.Fatalf("environment=%v", environment)
+	}
+	envData, err := os.ReadFile(envPath)
+	if err != nil || !strings.Contains(string(envData), githubPATEnvName+"=github-secret-value\n") || strings.HasPrefix(strings.TrimSpace(string(envData)), "{") {
+		t.Fatalf("environment file=%q error=%v", envData, err)
 	}
 	if runtime.GOOS != "windows" {
 		assertMode(t, configPath, 0o600)
@@ -180,8 +212,8 @@ func TestSetupPreservesExistingConfigAndSecrets(t *testing.T) {
 	if err := os.Symlink(target, configPath); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	envPath := filepath.Join(configDir, pdoEnvFileName)
-	if err := os.WriteFile(envPath, []byte(`{"PDO_GITHUB_PAT":"old-pat","PDO_CLOUD_CLIPBOARD_PASSWORD":"old-password","OTHER":"keep"}`), 0o644); err != nil {
+	legacyEnvPath := filepath.Join(configDir, legacyPDOEnvFileName)
+	if err := os.WriteFile(legacyEnvPath, []byte(`{"PDO_GITHUB_PAT":"old-pat","PDO_CLOUD_CLIPBOARD_PASSWORD":"old-password","OTHER":"keep"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	stdout, stderr, code := runSetupForTest(t, "\n\n", "")
@@ -218,7 +250,8 @@ func TestSetupPreservesExistingConfigAndSecrets(t *testing.T) {
 	if string(github["pat_env"]) != `"PDO_GITHUB_PAT"` || string(github["custom"]) != "true" || dotfiles["git-config"] == nil || string(sshConfig["local"]) != `"~/.ssh/custom"` || string(sshConfig["custom"]) != "true" || string(cloud["password_env"]) != `"OLD_PASSWORD"` || string(cloud["custom"]) != "true" {
 		t.Fatalf("document=%s", data)
 	}
-	environment, _, err := readPDOEnv(envPath)
+	envPath := filepath.Join(configDir, pdoEnvFileName)
+	environment, _, err := readPDOEnv(home)
 	if err != nil {
 		t.Fatal(err)
 	}
